@@ -32,12 +32,15 @@ jobs:
       - name: Build Nukkit-MOT (compile dependency only)
         if: steps.cache-nukkit.outputs.cache-hit != 'true'
         run: |
+          set -eux
+          mkdir -p "$GITHUB_WORKSPACE/libs"
           git clone --depth 1 --branch 1.26.50-R1 \
             https://github.com/MemoriesOfTime/Nukkit-MOT.git /tmp/nukkit-mot
           cd /tmp/nukkit-mot
           mvn -B -q package -DskipTests
-          mkdir -p "$GITHUB_WORKSPACE/libs"
-          cp target/*.jar "$GITHUB_WORKSPACE/libs/Nukkit-MOT-SNAPSHOT.jar"
+          ls -l target
+          jar_file=$(ls target/*.jar | grep -v original | head -n 1)
+          cp "$jar_file" "$GITHUB_WORKSPACE/libs/Nukkit-MOT-SNAPSHOT.jar"
           ls -l "$GITHUB_WORKSPACE/libs"
 
       - uses: gradle/actions/setup-gradle@v4
