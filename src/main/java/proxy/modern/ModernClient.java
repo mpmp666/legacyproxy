@@ -102,7 +102,15 @@ public class ModernClient {
     public void sendLogin(String username) throws Exception {
         String identity = java.util.UUID.nameUUIDFromBytes(
                 ("legacy:" + username).getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
-        String payloadJson = "{\"identityPublicKey\":\"" + base64Url("legacy-identity-key".getBytes()) +
+        // The chain's identityPublicKey is not decoration: when the backend has encryption enabled
+        // it derives the session key with ECDH over exactly this key
+        // (PrepareEncryptionTask -> EncryptionUtils.getSecretKey(..., parseKey(identityPublicKey), ...)).
+        // A fake value makes parseKey throw and the backend closes the connection with
+        // "Network Encryption error".
+        java.security.KeyPair identityPair = identityKeyPair();
+        String identityPublicKey = java.util.Base64.getEncoder()
+                .encodeToString(identityPair.getPublic().getEncoded());
+        String payloadJson = "{\"identityPublicKey\":\"" + identityPublicKey +
                 "\",\"extraData\":{\"displayName\":\"" + username + "\",\"identity\":\"" + identity + "\"}}";
         String chainJson = "{\"chain\":[\"" + jwt(payloadJson) + "\"]}";
         String authJson = "{\"Certificate\":\"" + chainJson.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
@@ -258,17 +266,58 @@ public class ModernClient {
     /** Continuous inflate stream — Bedrock's compression is a persistent raw-deflate stream, not per-packet. */
     private final java.util.zip.Inflater batchInflater = new java.util.zip.Inflater(true);
 
+    /** Set once the server asks for an encrypted connection; every frame then goes through it. */
+    private volatile BedrockEncryption encryption;
+    /** -Dproxy.modern.encdebug=true dumps every encrypted frame (both directions). */
+    private static final boolean DEBUG_ENC = Boolean.getBoolean("proxy.modern.encdebug");
+    /** Exact bytes of the last encrypted frame, so it can be re-sent verbatim (same counter). */
+    private volatile byte[] lastEncryptedFrame;
+    /** True once the server has answered something we could decrypt. */
+    private volatile boolean encryptedReplySeen;
+    private volatile int lastSentSeq = -1;
+    private final java.util.Set<Integer> ackedSeqs = java.util.Collections.synchronizedSet(new java.util.HashSet<Integer>());
+    /** Our login-chain identity key; the backend uses it for the encryption ECDH. */
+    private java.security.KeyPair identityKeyPair;
+
+    private java.security.KeyPair identityKeyPair() throws Exception {
+        if (identityKeyPair == null) {
+            java.security.KeyPairGenerator generator = java.security.KeyPairGenerator.getInstance("EC");
+            generator.initialize(new java.security.spec.ECGenParameterSpec("secp384r1"));
+            identityKeyPair = generator.generateKeyPair();
+        }
+        return identityKeyPair;
+    }
+
     public void decodeBatch(byte[] frame, int off) {
-        byte[] data = frame;
-        int startPos = off;
+        byte[] data;
+        int startPos;
+        if (encryption != null) {
+            // The whole region after the 0xfe marker is one AES-CFB8 stream that also carries the
+            // checksum in its last 8 bytes; decrypt() verifies it and strips both.
+            byte[] region = java.util.Arrays.copyOfRange(frame, off, frame.length);
+            if (DEBUG_ENC) {
+                System.out.println("[enc] recv wire=" + region.length + "B head="
+                        + bytesToHex(region, Math.min(20, region.length)));
+            }
+            data = encryption.decrypt(region);
+            encryptedReplySeen = true;
+            if (DEBUG_ENC) {
+                System.out.println("[enc] recv plain=" + data.length + "B head="
+                        + bytesToHex(data, Math.min(12, data.length)));
+            }
+            startPos = 0;
+        } else {
+            data = frame;
+            startPos = off;
+        }
         if (compressionEnabled) {
             try {
                 // compressed batches carry a 1-byte compression prefix (ZLIB = 0x00); skip it
-                int dataOff = off;
-                if (dataOff < frame.length && frame[dataOff] == 0x00) dataOff++;
+                int dataOff = startPos;
+                if (dataOff < data.length && data[dataOff] == 0x00) dataOff++;
                 // each batch is a COMPLETE raw-deflate stream (server calls reset+finish per packet) — fresh Inflater
                 java.util.zip.Inflater inf = new java.util.zip.Inflater(true);
-                inf.setInput(frame, dataOff, frame.length - dataOff);
+                inf.setInput(data, dataOff, data.length - dataOff);
                 java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
                 byte[] buf = new byte[131072];
                 int n;
@@ -340,6 +389,32 @@ public class ModernClient {
                 this.compressionEnabled = (algo != 0);
             }
             if (packetId == 0x06) note = " ResourcePacksInfo payload=" + bytesToHex(java.util.Arrays.copyOfRange(frame, hpos, Math.min(hpos + 24, pos + len)), Math.min(24, pos + len - hpos));
+            if (packetId == 0x03) {
+                // ServerToClientHandshake: [varuint len][jwt]. Derive the session key and answer with
+                // ClientToServerHandshake (0x04). The server enables its own ciphers at the same
+                // moment it sends this packet, so the reply has to be encrypted already.
+                try {
+                    int lp = hpos;
+                    int jlen = 0, jshift = 0;
+                    while (true) {
+                        int b = frame[lp++] & 0xff;
+                        jlen |= (b & 0x7f) << jshift;
+                        if ((b & 0x80) == 0) break;
+                        jshift += 7;
+                    }
+                    String jwt = new String(frame, lp, jlen, java.nio.charset.StandardCharsets.UTF_8);
+                    // NOTE: from the moment the server sends this packet its ciphers are live, so
+                    // NOTHING may be sent in plaintext in between — a stray frame would advance the
+                    // server's decrypt counter and desynchronise every following packet.
+                    this.encryption = BedrockEncryption.fromHandshakeJwt(jwt, identityKeyPair().getPrivate());
+                    System.out.println("[modern] encryption handshake received, session key derived");
+                    sendGamePacket(0x04, new byte[0]);
+                    System.out.println("[modern] ClientToServerHandshake sent (encrypted)");
+                    retryHandshakeUntilAnswered();
+                } catch (Exception e) {
+                    System.out.println("[modern] encryption handshake failed: " + e);
+                }
+            }
             System.out.println("[modern] game packet id=0x" + Integer.toHexString(packetId) + " len=" + payloadLen + note);
             // Forward the packet to the bridge BEFORE running the login-phase callbacks.
             // The StartGame callback builds the whole 0.14 bootstrap, so the bridge must have
@@ -447,6 +522,42 @@ public class ModernClient {
 
     private static final String[] STATUS_NAMES = {"cancel", "downloading", "downloadingfinished", "resourcepackstackfinished"};
 
+    /**
+     * The encrypted handshake is the one packet that cannot be re-encrypted: its checksum is bound
+     * to the packet counter, so a re-send must repeat the <b>same bytes</b>. Losing it is otherwise
+     * fatal — the server sits in AWAITING_ENCRYPTION_RESPONSE until it times out — so if nothing
+     * decryptable comes back we repeat the identical frame. Once the server answers we never
+     * re-send, which keeps the counter in step.
+     */
+    private void retryHandshakeUntilAnswered() {
+        Thread t = new Thread(() -> {
+            for (int attempt = 0; attempt < 3 && !encryptedReplySeen; attempt++) {
+                try {
+                    Thread.sleep(1200);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (encryptedReplySeen || ackedSeqs.contains(lastSentSeq)) {
+                    return;
+                }
+                byte[] frame = lastEncryptedFrame;
+                if (frame == null) {
+                    return;
+                }
+                try {
+                    System.out.println("[modern] no encrypted reply yet, re-sending handshake frame (attempt "
+                            + (attempt + 2) + ")");
+                    sendFrameSingle(frame, -1, -1, -1);
+                } catch (Exception e) {
+                    System.out.println("[modern] handshake retry failed: " + e);
+                    return;
+                }
+            }
+        }, "enc-handshake-retry");
+        t.setDaemon(true);
+        t.start();
+    }
+
     /** Sends RequestNetworkSettingsPacket (0xc1) — the first step of the modern login flow. */
     public void sendRequestNetworkSettings() throws Exception {
         java.io.ByteArrayOutputStream p = new java.io.ByteArrayOutputStream();
@@ -477,6 +588,22 @@ public class ModernClient {
 
     /** Sends one payload as a reliable-ordered RakNet data frame (splitting across frames if big). */
     private void sendFrame(byte[] payload) throws Exception {
+        if (encryption != null && payload.length > 1 && payload[0] == (byte) GAME_PACKET_MARKER) {
+            // Bedrock encrypts the MCPE layer, i.e. everything after the 0xfe marker:
+            // [0xfe][cipher(prefix || compressed || checksum)]. RakNet splitting happens on top.
+            byte[] region = new byte[payload.length - 1];
+            System.arraycopy(payload, 1, region, 0, region.length);
+            byte[] encrypted = encryption.encrypt(region);
+            byte[] framed = new byte[encrypted.length + 1];
+            framed[0] = (byte) GAME_PACKET_MARKER;
+            System.arraycopy(encrypted, 0, framed, 1, encrypted.length);
+            if (DEBUG_ENC) {
+                System.out.println("[enc] send plain=" + region.length + "B wire=" + framed.length + "B head="
+                        + bytesToHex(framed, Math.min(20, framed.length)));
+            }
+            payload = framed;
+            lastEncryptedFrame = framed;
+        }
         int maxPayload = mtu - 60;   // leave room for headers + split header
         if (payload.length <= maxPayload) {
             sendFrameSingle(payload, -1, -1, -1);
@@ -497,6 +624,7 @@ public class ModernClient {
     private void sendFrameSingle(byte[] payload, int splitCount, int splitId, int splitIndex) throws Exception {
         java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
         b.write(0x84);                       // DATA_PACKET_4
+        lastSentSeq = seq;
         b.write(ltriad(seq++), 0, 3);
         boolean split = splitCount > 0;
         b.write(split ? 0x70 : 0x60);        // reliability 3 + split flag if splitting
@@ -574,8 +702,10 @@ public class ModernClient {
                     int endSeq = (reply[pos] & 0xff) | ((reply[pos + 1] & 0xff) << 8) | ((reply[pos + 2] & 0xff) << 16);
                     pos += 3;
                     sb.append(start).append("-").append(endSeq).append(" ");
+                    if (id == 0xc0) { for (int s = start; s <= endSeq && s <= start + 4096; s++) ackedSeqs.add(s); }
                 } else {
                     sb.append(start).append(" ");
+                    if (id == 0xc0) ackedSeqs.add(start);
                 }
             }
             System.out.println("[modern] " + sb);
