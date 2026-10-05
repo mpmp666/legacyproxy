@@ -43,7 +43,11 @@ jobs:
             https://github.com/MemoriesOfTime/Nukkit-MOT.git /tmp/nukkit-mot
           cd /tmp/nukkit-mot
           mvn -B -q package -DskipTests
-          jar_file=$(ls target/*.jar | grep -v original | head -n 1)
+          ls -lS target/*.jar
+          # The shaded jar is by far the biggest one; the thin/original jar has no cn.nukkit classes.
+          jar_file=$(ls -S target/*.jar | head -n 1)
+          unzip -l "$jar_file" | grep -q 'cn/nukkit/network/protocol/InventoryTransactionPacket.class' \
+            || { echo "::error::$jar_file is not the shaded Nukkit-MOT jar"; exit 1; }
           cp "$jar_file" "$GITHUB_WORKSPACE/libs/Nukkit-MOT-SNAPSHOT.jar"
           ls -l "$GITHUB_WORKSPACE/libs"
 
