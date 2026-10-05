@@ -27,10 +27,29 @@ repositories {
  */
 val nukkitJar: String? = (findProperty("nukkitJar") as String?)
 
+// Resolve libs/*.jar with the plain file API: a fileTree() inside the dependencies block can
+// silently resolve to an empty collection, which shows up as 125 "package cn.nukkit does not
+// exist" errors instead of a useful message.
+val localJars: List<File> = file("libs")
+    .listFiles { f: File -> f.isFile && f.name.endsWith(".jar") }
+    ?.toList()
+    ?: emptyList()
+
 dependencies {
-    implementation(fileTree("libs") { include("*.jar") })
+    implementation(files(localJars))
     if (nukkitJar != null) {
         implementation(files(nukkitJar))
+    }
+}
+
+tasks.named("compileJava") {
+    doFirst {
+        if (localJars.isEmpty() && nukkitJar == null) {
+            throw GradleException(
+                "Nukkit-MOT jar not found. Put it in libs/ (see README) or pass -PnukkitJar=<path>."
+            )
+        }
+        logger.lifecycle("Nukkit-MOT jar(s): " + (localJars + listOfNotNull(nukkitJar)).joinToString())
     }
 }
 
