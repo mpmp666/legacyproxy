@@ -23,22 +23,26 @@ jobs:
       # is not published to Maven Central, so fetch the matching tag and build it once; the
       # result is cached between runs.
       - name: Cache Nukkit-MOT jar
-        id: cache-nukkit
         uses: actions/cache@v4
         with:
           path: libs
-          key: nukkit-mot-1.26.50-R1
+          key: nukkit-mot-v2-1.26.50-R1
 
-      - name: Build Nukkit-MOT (compile dependency only)
-        if: steps.cache-nukkit.outputs.cache-hit != 'true'
+      # Keyed on the file, not on cache-hit: a cache entry can legitimately be empty, and then
+      # the compile classpath would be missing every cn.nukkit class.
+      - name: Ensure the Nukkit-MOT jar is present
         run: |
           set -eux
-          mkdir -p "$GITHUB_WORKSPACE/libs"
+          mkdir -p libs
+          if [ -f libs/Nukkit-MOT-SNAPSHOT.jar ]; then
+            echo "reusing cached server jar"
+            ls -l libs
+            exit 0
+          fi
           git clone --depth 1 --branch 1.26.50-R1 \
             https://github.com/MemoriesOfTime/Nukkit-MOT.git /tmp/nukkit-mot
           cd /tmp/nukkit-mot
           mvn -B -q package -DskipTests
-          ls -l target
           jar_file=$(ls target/*.jar | grep -v original | head -n 1)
           cp "$jar_file" "$GITHUB_WORKSPACE/libs/Nukkit-MOT-SNAPSHOT.jar"
           ls -l "$GITHUB_WORKSPACE/libs"
