@@ -32,8 +32,20 @@ encryption=on
 # The 0.14 client cannot send PlayerAuthInput, and this backend hard-codes server-authoritative
 # movement for protocol >= 1.21.90, so the proxy synthesises PlayerAuthInput itself.
 server-authoritative-movement=client-auth
-# Legacy TYPE_NORMAL inventory transactions are how the proxy mirrors the old client's hotbar.
-server-authoritative-inventory=off
+# The proxy mirrors the old client's hotbar with legacy TYPE_NORMAL inventory transactions. It
+# works with either value of server-authoritative-inventory — but when it is ON the backend must
+# also recognise the session as a proxy, which is what "WaterDog mode" is for (see below).
+server-authoritative-inventory=on
+```
+
+And in `nukkit-mot.yml`:
+
+```yaml
+network:
+  # Marks the session as a proxy player, so the server stops applying its server-authoritative
+  # inventory gate to it. LegacyProxy puts a Waterdog_XUID claim into the login token; without
+  # it, server-authoritative-inventory=on silently drops every hotbar/placement transaction.
+  use-waterdog: true
 ```
 
 ## Build
@@ -123,6 +135,10 @@ require-encryption=true  # refuse to play unless the backend encrypts the connec
   hotbar into the backend inventory. Nukkit requires item *conservation*
   (`InventoryTransaction.matchItems`), so the slot change is padded with two creative
   create/delete actions that are validation no-ops.
+  This still works with `server-authoritative-inventory=on`, provided the backend also runs
+  `use-waterdog: true`: the login token carries a `Waterdog_XUID` claim, the server then treats
+  the session as a proxy player (`Player.isInventorySAIGateActive()` returns false) and accepts
+  the legacy transactions instead of dropping them.
 * **Inventory & drops** — `InventoryContent` (0x31) → 0.14 `ContainerSetContent` (36 slots +
   HUD hotbar); `AddItemEntity` / `TakeItemEntity` / `RemoveEntity` keep drops in sync.
 * **Chat, commands, gamemode, death** — chat goes through `TextPacket`; commands must be sent

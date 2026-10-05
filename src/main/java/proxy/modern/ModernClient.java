@@ -123,7 +123,7 @@ public class ModernClient {
                 "\",\"extraData\":{\"displayName\":\"" + username + "\",\"identity\":\"" + identity + "\"}}";
         String chainJson = "{\"chain\":[\"" + jwt(payloadJson) + "\"]}";
         String authJson = "{\"Certificate\":\"" + chainJson.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
-        String skinJwt = jwtBasic(buildSkinJson());
+        String skinJwt = jwtBasic(buildSkinJson(username));
 
         // body: [LInt chainLen][chain][LInt skinLen][skin]
         java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
@@ -188,8 +188,20 @@ public class ModernClient {
         sendFrame(frame.toByteArray());
     }
 
-    /** Builds a valid modern skin token (a 64x64 solid-tone skin + the humanoid geometry). */
-    private static String buildSkinJson() {
+    /**
+     * Builds a valid modern skin token (a 64x64 solid-tone skin + the humanoid geometry).
+     *
+     * <p>The {@code Waterdog_XUID} claim is what makes the backend treat this session as a proxy
+     * player. {@code ClientChainData.decodeSkinData} reads it from this token, and
+     * {@code Player.isInventorySAIGateActive()} then stops applying the server-authoritative
+     * inventory gate. Without it, a backend running with
+     * {@code server-authoritative-inventory=on} silently drops every legacy
+     * {@code TYPE_NORMAL} inventory transaction ("dropping legacy InventoryTransaction
+     * TYPE_NORMAL while SAI is enabled"), so the 0.14 hotbar mirror and creative placement go
+     * nowhere while everything else keeps working. The backend honours the claim only when its
+     * own {@code use-waterdog} setting is on, so sending it unconditionally is safe.
+     */
+    private static String buildSkinJson(String username) {
         // 64x64 RGBA skin, filled with a skin-tone colour so the player isn't invisible
         byte[] skinImage = new byte[64 * 64 * 4];
         for (int i = 0; i < skinImage.length; i += 4) {
@@ -217,9 +229,23 @@ public class ModernClient {
         sb.append("\"SkinColor\":\"#0\",");
         sb.append("\"ArmSize\":\"classic\",");
         sb.append("\"TrustedSkin\":true,");
-        sb.append("\"IsEmoteSettingsLocked\":false");
+        sb.append("\"IsEmoteSettingsLocked\":false,");
+        // Marks the session as a proxy player (see the note above). The XUID has to be stable per
+        // name because Waterdog mode makes it the player's identity on the backend.
+        sb.append("\"Waterdog_XUID\":\"").append(waterdogXuid(username)).append("\"");
         sb.append("}");
         return sb.toString();
+    }
+
+    /** A stable 16-digit XUID for an offline-mode player, so the backend has an identity to key on. */
+    private static String waterdogXuid(String username) {
+        long hash = 0xcbf29ce484222325L;                       // FNV-1a, deterministic per name
+        for (byte b : username.getBytes(java.nio.charset.StandardCharsets.UTF_8)) {
+            hash ^= (b & 0xff);
+            hash *= 0x100000001b3L;
+        }
+        long value = Math.floorMod(hash, 9_000_000_000_000_000L) + 1_000_000_000_000_000L;
+        return Long.toString(value);
     }
 
     /** Test harness: connect to a backend and report. Usage: ModernClient <host> <port> */

@@ -1,0 +1,19 @@
+modern: declare a Waterdog XUID so the backend drops its SAI gate for proxy players
+
+With server-authoritative-inventory=on the backend silently discards the legacy
+TYPE_NORMAL inventory transactions the bridge uses to mirror the 0.14 hotbar
+("dropping legacy InventoryTransaction TYPE_NORMAL while SAI is enabled"), so
+creative placement and the hotbar mirror go nowhere — from the client's side it
+looks exactly like packet corruption. Nukkit-MOT has a deliberate escape hatch:
+Player.isInventorySAIGateActive() bypasses the gate for proxy players that carry
+a Waterdog_XUID claim in the login token's client-data JWT, provided the server
+enables use-waterdog.
+
+The claim is a stable 16-digit value derived from the player name, since
+Waterdog mode makes it the player's identity on the backend. Servers with
+use-waterdog=false ignore the claim, so sending it unconditionally is safe.
+
+Verified against Nukkit-MOT 1.26.50 with server-authoritative-inventory=on and
+use-waterdog=true: the backend logs SAI=false for the session, the hotbar mirror
+transaction executes, and placement, mining, chat/commands, inventory sync,
+death/respawn and watching other players all pass end to end.
