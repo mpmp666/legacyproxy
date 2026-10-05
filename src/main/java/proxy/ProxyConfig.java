@@ -16,16 +16,20 @@ import java.util.Properties;
  * listen-port=19132              # the port 0.14.3 clients connect to
  * backend-host=127.0.0.1         # the modern (1.26.50) server the proxy forwards to
  * backend-port=19133
+ * require-encryption=true        # refuse to play unless the backend negotiates connection encryption
  * </pre>
  */
 public final class ProxyConfig {
 
     public final int listenPort;
     public final InetSocketAddress backend;
+    /** When true (default) a backend that does not encrypt the connection is rejected. */
+    public final boolean requireEncryption;
 
-    private ProxyConfig(int listenPort, InetSocketAddress backend) {
+    private ProxyConfig(int listenPort, InetSocketAddress backend, boolean requireEncryption) {
         this.listenPort = listenPort;
         this.backend = backend;
+        this.requireEncryption = requireEncryption;
     }
 
     public static ProxyConfig load(Path file) throws IOException {
@@ -39,6 +43,7 @@ public final class ProxyConfig {
             p.setProperty("listen-port", "19132");
             p.setProperty("backend-host", "127.0.0.1");
             p.setProperty("backend-port", "19133");
+            p.setProperty("require-encryption", "true");
             try (OutputStream out = Files.newOutputStream(file)) {
                 p.store(out, "LegacyProxy configuration");
             }
@@ -46,11 +51,13 @@ public final class ProxyConfig {
         int listenPort = Integer.parseInt(p.getProperty("listen-port", "19132").trim());
         String backendHost = p.getProperty("backend-host", "127.0.0.1").trim();
         int backendPort = Integer.parseInt(p.getProperty("backend-port", "19133").trim());
-        return new ProxyConfig(listenPort, new InetSocketAddress(backendHost, backendPort));
+        boolean requireEncryption = Boolean.parseBoolean(p.getProperty("require-encryption", "true").trim());
+        return new ProxyConfig(listenPort, new InetSocketAddress(backendHost, backendPort), requireEncryption);
     }
 
     public static void main(String[] args) throws IOException {
         ProxyConfig c = load(Paths.get("proxy.properties"));
-        System.out.println("listen=" + c.listenPort + " backend=" + c.backend);
+        System.out.println("listen=" + c.listenPort + " backend=" + c.backend
+                + " require-encryption=" + c.requireEncryption);
     }
 }

@@ -20,6 +20,8 @@ rakref/
 *Dump.java
 BuildBlockMap.java
 CompTest.java
+# ...except the encryption self-test, which CI runs as a build step
+!src/main/java/proxy/SelfTest.java
 
 # IDE
 .idea/

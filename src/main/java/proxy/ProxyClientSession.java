@@ -28,6 +28,11 @@ public class ProxyClientSession implements LegacySessionListener {
     private static final float EYE_HEIGHT = 1.62f;
 
     private final InetSocketAddress backend;
+    /**
+     * When true (the default) the bridge refuses to serve a 0.14.3 client unless the backend
+     * negotiated connection encryption, i.e. it sent a ServerToClientHandshake we answered.
+     */
+    private final boolean requireEncryption;
     private LegacySession legacySession;
     private ModernClient modernClient;
     private String username = "Player";
@@ -111,8 +116,9 @@ public class ProxyClientSession implements LegacySessionListener {
     private volatile boolean spawned = false;
     private final java.util.Set<Long> sentChunks = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    public ProxyClientSession(InetSocketAddress backend) {
+    public ProxyClientSession(InetSocketAddress backend, boolean requireEncryption) {
         this.backend = backend;
+        this.requireEncryption = requireEncryption;
     }
 
     @Override
@@ -404,6 +410,15 @@ public class ProxyClientSession implements LegacySessionListener {
 
     /** The backend finished logging us in: send the 0.14 world bootstrap. */
     private void onBackendStartGame() throws Exception {
+        // The backend only reaches StartGame once it has accepted the login. If it never asked for
+        // connection encryption the traffic is in the clear, which is exactly what
+        // require-encryption=true forbids: drop the legacy client instead of playing.
+        if (requireEncryption && (modernClient == null || !modernClient.isEncrypted())) {
+            System.out.println("[proxy] refusing backend: connection encryption was not negotiated"
+                    + " (require-encryption=true)");
+            legacySession.close("This server requires an encrypted connection");
+            return;
+        }
         System.out.println("[proxy] backend StartGame -> sending 0.14 world (spawn "
                 + spawnX + "," + spawnY + "," + spawnZ + " gamemode " + gamemode + ")");
         // 0.14 StartGame: the player's own entity id MUST be 0 (Nukkit-0143:

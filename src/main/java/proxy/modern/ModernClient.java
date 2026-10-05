@@ -47,6 +47,15 @@ public class ModernClient {
         this.backend = backend;
         this.socket = new DatagramSocket();
         this.socket.setSoTimeout(5000);
+        // The backend answers StartGame with a ~75 KB burst split over dozens of datagrams. A
+        // default-sized receive buffer drops some of them, and because the payload is an AES/CTR
+        // stream a single missing datagram shifts every later packet — ask for room instead of
+        // relying on the resynchroniser.
+        try {
+            this.socket.setReceiveBufferSize(1 << 20);
+        } catch (Exception ignored) {
+            // best effort: the buffer size is a hint and the platform may cap it
+        }
     }
 
     public void close() {
@@ -276,6 +285,15 @@ public class ModernClient {
     private volatile boolean encryptedReplySeen;
     private volatile int lastSentSeq = -1;
     private final java.util.Set<Integer> ackedSeqs = java.util.Collections.synchronizedSet(new java.util.HashSet<Integer>());
+    /** Ring of received datagram sequence numbers, so retransmits are not decrypted twice. */
+    private final boolean[] seenSeqs = new boolean[0x10000];
+    private int highestSeq = -1;
+    private int duplicatesIgnored;
+    /** Frame to re-send while the server has not reacted to the encryption handshake. */
+    private volatile byte[] handshakeFrame;
+    private volatile long handshakeSentAt;
+    private volatile int handshakeResends;
+    private volatile int handshakeSeq = -1;
     /** Our login-chain identity key; the backend uses it for the encryption ECDH. */
     private java.security.KeyPair identityKeyPair;
 
@@ -410,7 +428,7 @@ public class ModernClient {
                     System.out.println("[modern] encryption handshake received, session key derived");
                     sendGamePacket(0x04, new byte[0]);
                     System.out.println("[modern] ClientToServerHandshake sent (encrypted)");
-                    retryHandshakeUntilAnswered();
+                    armHandshakeRetry();
                 } catch (Exception e) {
                     System.out.println("[modern] encryption handshake failed: " + e);
                 }
@@ -448,6 +466,11 @@ public class ModernClient {
     public Runnable onResourcePacksInfo;
     public Runnable onResourcePackStack;
     public Runnable onStartGame;
+
+    /** True once the ServerToClientHandshake was answered and the session key is installed. */
+    public boolean isEncrypted() {
+        return encryption != null;
+    }
     public Runnable onNetworkSettings;
     /** Every decoded game packet: (packetId, payload after the varint header). */
     public java.util.function.BiConsumer<Integer, byte[]> onGamePacket;
@@ -462,6 +485,7 @@ public class ModernClient {
             return;
         }
         while (!closed) {
+            maybeResendHandshake();
             try {
                 java.util.List<byte[]> frames = readFrames();
                 for (byte[] frame : frames) {
@@ -529,33 +553,50 @@ public class ModernClient {
      * decryptable comes back we repeat the identical frame. Once the server answers we never
      * re-send, which keeps the counter in step.
      */
-    private void retryHandshakeUntilAnswered() {
-        Thread t = new Thread(() -> {
-            for (int attempt = 0; attempt < 3 && !encryptedReplySeen; attempt++) {
-                try {
-                    Thread.sleep(1200);
-                } catch (InterruptedException e) {
-                    return;
-                }
-                if (encryptedReplySeen || ackedSeqs.contains(lastSentSeq)) {
-                    return;
-                }
-                byte[] frame = lastEncryptedFrame;
-                if (frame == null) {
-                    return;
-                }
-                try {
-                    System.out.println("[modern] no encrypted reply yet, re-sending handshake frame (attempt "
-                            + (attempt + 2) + ")");
-                    sendFrameSingle(frame, -1, -1, -1);
-                } catch (Exception e) {
-                    System.out.println("[modern] handshake retry failed: " + e);
-                    return;
-                }
-            }
-        }, "enc-handshake-retry");
-        t.setDaemon(true);
-        t.start();
+    /** Grace period before repeating the handshake frame when RakNet never acknowledged it. */
+    private static final long HANDSHAKE_RESEND_UNACKED_MS = 1500;
+    /** Grace period when the frame was acknowledged but the server has not answered yet. */
+    private static final long HANDSHAKE_RESEND_ACKED_MS = 2500;
+
+    /** Arms the retry; the actual check happens on the read-loop thread. */
+    private void armHandshakeRetry() {
+        this.handshakeFrame = lastEncryptedFrame;
+        this.handshakeSeq = lastSentSeq;
+        this.handshakeSentAt = System.currentTimeMillis();
+        this.handshakeResends = 0;
+    }
+
+    /**
+     * Runs on the read-loop thread, i.e. the same thread that receives packets, so no reply can
+     * slip in between the check and the re-send. The frame is repeated verbatim (same counter),
+     * which is safe exactly when the server never processed it: had it done so we would already
+     * have received a decryptable reply, and had it rejected it we would have been disconnected.
+     */
+    private void maybeResendHandshake() {
+        byte[] frame = handshakeFrame;
+        // NOTE: a RakNet ACK only proves the datagram reached the transport, not that the session
+        // processed it — an ACKed frame was observed to be dropped anyway (the server enables its
+        // decryptor asynchronously, so a frame that lands a hair too early is discarded even though
+        // RakNet acknowledged it). The ACK is therefore used as the *urgency* signal only: an
+        // unacknowledged frame was lost in transit and is repeated quickly, an acknowledged one is
+        // given a longer grace period for the server's reply before we repeat it verbatim.
+        if (frame == null || encryptedReplySeen || handshakeResends >= 3) {
+            return;
+        }
+        long grace = ackedSeqs.contains(handshakeSeq) ? HANDSHAKE_RESEND_ACKED_MS : HANDSHAKE_RESEND_UNACKED_MS;
+        if (System.currentTimeMillis() - handshakeSentAt < grace) {
+            return;
+        }
+        handshakeResends++;
+        handshakeSentAt = System.currentTimeMillis();
+        try {
+            System.out.println("[modern] no encrypted reply yet, re-sending handshake frame (attempt "
+                    + (handshakeResends + 1) + ")");
+            sendFrameSingle(frame, -1, -1, -1);
+        } catch (Exception e) {
+            System.out.println("[modern] handshake retry failed: " + e);
+            handshakeResends = 3;
+        }
     }
 
     /** Sends RequestNetworkSettingsPacket (0xc1) — the first step of the modern login flow. */
@@ -656,11 +697,22 @@ public class ModernClient {
     /** Split-frame reassembly buffers, keyed by splitId. */
     private final java.util.Map<Integer, byte[][]> splitBuffers = new java.util.HashMap<>();
     private final java.util.Map<Integer, Integer> splitExpected = new java.util.HashMap<>();
+    /** Frames waiting for the split packets ahead of them; a null entry is a split still missing parts. */
+    private final java.util.List<byte[]> pendingFrames = new java.util.ArrayList<>();
+    /** Split id -> index in {@link #pendingFrames} reserved by its first part. */
+    private final java.util.Map<Integer, Integer> splitSlots = new java.util.HashMap<>();
+    /** Split id -> {completion time, part count}, so a late retransmitted part is not reassembled twice. */
+    private final java.util.Map<Integer, long[]> completedSplits = new java.util.HashMap<>();
+    private static final long COMPLETED_SPLIT_MEMORY_MS = 5000;
+    private long pendingSince;
 
     /** Buffers one split part; returns the reassembled payload when all parts are in, else null. */
     private byte[] addSplitPart(int splitId, int count, int index, byte[] part) {
         byte[][] buf = splitBuffers.computeIfAbsent(splitId, k -> new byte[count][]);
         splitExpected.putIfAbsent(splitId, count);
+        if (buf[index] != null) {
+            return null;      // retransmitted part: the payload is already assembled around it
+        }
         buf[index] = part;
         for (byte[] p : buf) {
             if (p == null) return null;
@@ -676,6 +728,10 @@ public class ModernClient {
         }
         splitBuffers.remove(splitId);
         splitExpected.remove(splitId);
+        completedSplits.put(splitId, new long[]{System.currentTimeMillis(), count});
+        if (completedSplits.size() > 4096) {
+            completedSplits.clear();   // split ids wrap around, so the memory is bounded anyway
+        }
         System.out.println("[modern] reassembled split id=" + splitId + " total=" + total + " bytes firstByte=0x" + (full.length>0?Integer.toHexString(full[0]&0xff):"empty"));
         return full;
     }
@@ -718,6 +774,26 @@ public class ModernClient {
                 System.out.println("[modern] recv data seq=" + seq + " len=" + reply.length
                         + " head=" + bytesToHex(reply, Math.min(24, reply.length)));
             }
+            // RakNet retransmits any datagram whose ACK we were too slow to send. A retransmit is
+            // byte-identical, and re-decrypting it would advance the payload's AES stream a second
+            // time — which is what used to shift every following packet. Track what we have seen
+            // and only re-ACK a duplicate. The 16-bit slot ring can only alias after 65536
+            // datagrams, and the seq>highest test makes a fresh packet never look like a repeat.
+            int slot = seq & 0xffff;
+            boolean duplicate = seenSeqs[slot] && seq <= highestSeq && seq > highestSeq - 0x8000;
+            if (duplicate) {
+                duplicatesIgnored++;
+                if (DEBUG_FRAMES) {
+                    System.out.println("[modern] duplicate datagram seq=" + seq + " ignored (total "
+                            + duplicatesIgnored + ")");
+                }
+                sendAck(seq);
+                return frames;
+            }
+            seenSeqs[slot] = true;
+            if (seq > highestSeq) {
+                highestSeq = seq;
+            }
             sendAck(seq);
             int off = 4;
             while (off < reply.length) {
@@ -743,19 +819,78 @@ public class ModernClient {
                 byte[] payload = new byte[copyLen];
                 System.arraycopy(reply, pos, payload, 0, copyLen);
                 if (split) {
-                    // buffer the part; return the reassembled payload when all parts are in
+                    // A split packet spans several datagrams, so the packets that arrive between
+                    // its parts must not overtake it: the server encrypted them *after* it, and
+                    // the payload is a stream cipher where order is everything. Reserve the slot
+                    // the first part arrived in and fill it once the last part is in.
+                    long[] done = completedSplits.get(splitId);
+                    if (done != null && done[1] == splitCount
+                            && System.currentTimeMillis() - done[0] < COMPLETED_SPLIT_MEMORY_MS) {
+                        // a retransmitted part of a split we already assembled and emitted
+                        off = pos + len;
+                        continue;
+                    }
+                    boolean first = !splitSlots.containsKey(splitId);
+                    if (first) {
+                        pendingFrames.add(null);
+                        splitSlots.put(splitId, pendingFrames.size() - 1);
+                        if (pendingSince == 0) {
+                            pendingSince = System.currentTimeMillis();
+                        }
+                    }
                     byte[] full = addSplitPart(splitId, splitCount, splitIndex, payload);
-                    if (full != null) frames.add(full);
+                    if (full != null) {
+                        Integer slotIndex = splitSlots.remove(splitId);
+                        if (slotIndex != null) {
+                            pendingFrames.set(slotIndex, full);
+                        } else {
+                            pendingFrames.add(full);
+                        }
+                    }
                 } else {
-                    frames.add(payload);
+                    pendingFrames.add(payload);
                 }
                 off = pos + len;
             }
-            return frames;
+            return drainPending();
         }
         // not a data frame (offline packet / ack) — return as a single raw frame
         frames.add(reply);
         return frames;
+    }
+
+    /** How long an incomplete split may hold back the packets behind it before we give up. */
+    private static final long SPLIT_WAIT_MS = 1500;
+
+    /**
+     * Emits the buffered frames once no split packet is still missing parts, i.e. in the order the
+     * server encrypted them. A part that never arrives would otherwise stall the session forever,
+     * so after {@link #SPLIT_WAIT_MS} the hole is abandoned and the rest is released (the cipher
+     * resynchroniser then recovers the resulting offset).
+     */
+    private java.util.List<byte[]> drainPending() {
+        for (byte[] frame : pendingFrames) {
+            if (frame == null) {
+                if (System.currentTimeMillis() - pendingSince < SPLIT_WAIT_MS) {
+                    return new java.util.ArrayList<>();
+                }
+                System.out.println("[modern] abandoning an incomplete split packet after "
+                        + SPLIT_WAIT_MS + "ms");
+                splitSlots.clear();
+                splitBuffers.clear();
+                splitExpected.clear();
+                break;
+            }
+        }
+        java.util.List<byte[]> out = new java.util.ArrayList<>(pendingFrames.size());
+        for (byte[] frame : pendingFrames) {
+            if (frame != null) {
+                out.add(frame);
+            }
+        }
+        pendingFrames.clear();
+        pendingSince = 0;
+        return out;
     }
 
     /** Responds to a ConnectedPing (0x00) with a ConnectedPong (0x03). */

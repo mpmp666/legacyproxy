@@ -40,13 +40,23 @@ public final class BedrockEncryption {
 
     /** AES key derived from the handshake; also the SHA-256 trailer input. */
     private final byte[] key;
-    private final Cipher encryptCipher;
-    private final Cipher decryptCipher;
+    private final byte[] iv;
+    private final String transformation;
+    private Cipher encryptCipher;
+    private Cipher decryptCipher;
     private long encryptCounter;
     private long decryptCounter;
+    /**
+     * Ciphertext bytes consumed so far in the receive direction. The cipher is a stream, so this
+     * is what has to be re-seeked to when a datagram is lost or duplicated in transit.
+     */
+    private long decryptStreamPos;
 
-    private BedrockEncryption(byte[] key, Cipher encryptCipher, Cipher decryptCipher) {
+    private BedrockEncryption(byte[] key, byte[] iv, String transformation,
+                              Cipher encryptCipher, Cipher decryptCipher) {
         this.key = key;
+        this.iv = iv;
+        this.transformation = transformation;
         this.encryptCipher = encryptCipher;
         this.decryptCipher = decryptCipher;
     }
@@ -112,7 +122,7 @@ public final class BedrockEncryption {
         enc.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
         Cipher dec = Cipher.getInstance(transformation);
         dec.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
-        return new BedrockEncryption(key, enc, dec);
+        return new BedrockEncryption(key, iv, transformation, enc, dec);
     }
 
     /** Base64url without padding (JWT segments omit it). */
@@ -183,26 +193,160 @@ public final class BedrockEncryption {
      * @return the plaintext {@code [prefix][compressedPayload]} (checksum stripped)
      */
     public byte[] decrypt(byte[] region) {
+        // RakNet retransmits datagrams whose ACK we were slow to send, and a retransmitted region
+        // is byte-identical: the same plaintext can never appear twice at two stream positions,
+        // so an identical region is a repeat. Feeding it to the cipher again would advance the
+        // stream a second time and shift every later packet.
+        if (lastRegion != null && Arrays.equals(region, lastRegion)) {
+            duplicateRegions++;
+            return Arrays.copyOf(lastPlain, lastPlain.length);
+        }
         byte[] plain;
         try {
             plain = decryptCipher.update(region);
         } catch (Exception e) {
             throw new IllegalStateException("decryption failed", e);
         }
-        if (plain.length < 9) {
-            throw new IllegalArgumentException("encrypted region too short: " + plain.length);
+        if (plain.length >= 9 && checksumMatches(plain, decryptCounter)) {
+            decryptCounter++;
+            decryptStreamPos += region.length;
+            remember(region, plain);
+            return strip(plain);
         }
+        return resynchronise(region);
+    }
+
+    /** Number of retransmitted regions recognised and skipped. */
+    private long duplicateRegions;
+    private byte[] lastRegion;
+    private byte[] lastPlain;
+
+    /** Remembers the last accepted region so an identical retransmit can be recognised. */
+    private void remember(byte[] region, byte[] plain) {
+        this.lastRegion = region;
+        this.lastPlain = strip(plain);      // callers get the payload, without the checksum
+    }
+
+    /** Strips the trailing checksum, returning {@code [prefix][compressedPayload]}. */
+    private static byte[] strip(byte[] plain) {
+        return Arrays.copyOf(plain, plain.length - 8);
+    }
+
+    /** Verifies the trailing 8 bytes of {@code plain} against {@code SHA-256(LE64(counter)||body||key)}. */
+    private boolean checksumMatches(byte[] plain, long counter) {
         int trailer = plain.length - 8;
-        byte[] payload = Arrays.copyOfRange(plain, 0, trailer);     // includes the compression prefix
-        byte[] expected = checksum(decryptCounter++, payload, 0, payload.length);
+        byte[] expected = checksum(counter, plain, 0, trailer);
         for (int i = 0; i < 8; i++) {
             if (plain[trailer + i] != expected[i]) {
-                throw new IllegalStateException("bad encrypted checksum on packet " + (decryptCounter - 1));
+                return false;
             }
         }
-        byte[] out = new byte[trailer];
-        System.arraycopy(plain, 0, out, 0, trailer);
-        return out;
+        return true;
+    }
+
+    /**
+     * How far back / forward the resynchroniser looks, in ciphertext bytes. A single missed chunk
+     * packet is tens to hundreds of kilobytes, and it can be missed in either direction: a lost
+     * datagram leaves the stream behind the server, while a packet that had to wait for a
+     * retransmitted split part is decrypted late, i.e. behind the packets that overtook it.
+     */
+    private static final int RESYNC_BACK = 1 << 19;
+    private static final int RESYNC_FORWARD = 1 << 19;
+    /**
+     * How many packet counters the resynchroniser tries behind the current one (a retransmitted
+     * datagram holds several already-seen packets) and ahead of it (a lost datagram holds several
+     * packets that never arrive). A 1400-byte datagram can carry a dozen small game packets, so
+     * the skip is not bounded by one.
+     */
+    private static final int RESYNC_COUNTERS_BACK = 64;
+    private static final int RESYNC_COUNTERS_FORWARD = 256;
+
+    /**
+     * Recovers from a lost or duplicated datagram.
+     *
+     * <p>AES/CTR is a stream: one missing ciphertext byte shifts every later packet, and the
+     * session dies with a checksum error even though nothing is actually corrupt. Both the
+     * counter and the stream offset can be recovered, because the trailing checksum is an
+     * 8-byte oracle over {@code (counter, plaintext)}: the code generates the keystream around
+     * the expected position once, then scans small byte offsets and packet-counter skips until
+     * a candidate reproduces its own checksum. On a hit the cipher is re-seeked past the
+     * recovered packet, so the session continues instead of dropping.
+     */
+    private byte[] resynchronise(byte[] region) {
+        long base = Math.max(0, decryptStreamPos - RESYNC_BACK);
+        int window = (int) (decryptStreamPos + RESYNC_FORWARD + region.length + 16 - base);
+        byte[] keystream;
+        try {
+            Cipher skip = newCipher(Cipher.ENCRYPT_MODE);   // CTR/CFB8 are symmetric
+            advance(skip, base);
+            keystream = skip.update(new byte[window]);
+        } catch (Exception e) {
+            throw new IllegalStateException("resync keystream failed", e);
+        }
+        int firstDelta = (int) (base - decryptStreamPos);
+        byte[] candidate = new byte[region.length];
+        int examined = 0;
+        for (int delta = firstDelta; delta <= RESYNC_FORWARD; delta++) {
+            int off = delta - firstDelta;
+            if (off < 0 || off + region.length > keystream.length) {
+                break;
+            }
+            // Cheap prefilter: every compressed batch begins with its compression prefix byte, so
+            // only offsets whose first plaintext byte is 0x00 can be a real packet boundary. That
+            // discards 255/256 of a megabyte-wide scan before any hashing happens.
+            if ((byte) (region[0] ^ keystream[off]) != 0x00) {
+                continue;
+            }
+            examined++;
+            for (int i = 0; i < candidate.length; i++) {
+                candidate[i] = (byte) (region[i] ^ keystream[off + i]);
+            }
+            if (candidate.length < 9) {
+                continue;
+            }
+            for (int cOff = -RESYNC_COUNTERS_BACK; cOff <= RESYNC_COUNTERS_FORWARD; cOff++) {
+                if (decryptCounter + cOff < 0) {
+                    continue;
+                }
+                if (!checksumMatches(candidate, decryptCounter + cOff)) {
+                    continue;
+                }
+                long newPos = decryptStreamPos + delta + region.length;
+                decryptCounter += cOff + 1;
+                decryptStreamPos = newPos;
+                try {
+                    decryptCipher = newCipher(Cipher.DECRYPT_MODE);
+                    advance(decryptCipher, newPos);
+                } catch (Exception e) {
+                    throw new IllegalStateException("resync reseek failed", e);
+                }
+                System.out.println("[enc] RESYNC byteDelta=" + delta + " counterSkip=" + cOff
+                        + " recovered packet " + (decryptCounter - 1) + " streamPos=" + newPos);
+                remember(region, candidate);
+                return strip(candidate);
+            }
+        }
+        throw new IllegalStateException("bad encrypted checksum on packet " + decryptCounter
+                + " (unrecoverable: streamPos=" + decryptStreamPos + " region=" + region.length
+                + "B candidates=" + examined + " window=" + keystream.length + "B)");
+    }
+
+    /** A fresh cipher over the session key/IV. */
+    private Cipher newCipher(int mode) throws Exception {
+        Cipher c = Cipher.getInstance(transformation);
+        c.init(mode, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
+        return c;
+    }
+
+    /** Consumes {@code bytes} of keystream so the cipher resumes at that stream offset. */
+    private static void advance(Cipher c, long bytes) throws Exception {
+        byte[] chunk = new byte[8192];
+        long left = bytes;
+        while (left > 0) {
+            int n = (int) Math.min(left, chunk.length);
+            c.update(chunk, 0, n);
+            left -= n;
+        }
     }
 
     /** SHA-256(LE64(counter) || payload || key)[0..8] — RakNetPlayerSession.calculateChecksum. */

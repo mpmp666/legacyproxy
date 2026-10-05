@@ -7,3 +7,8 @@ listen-port=19132
 # Modern Bedrock backend (Nukkit-MOT) to bridge to.
 backend-host=127.0.0.1
 backend-port=19133
+
+# Refuse to serve a 0.14.3 client unless the backend negotiated connection encryption.
+# The backend must run with encryption=on in server.properties; with this set to true a
+# backend that sends no ServerToClientHandshake is rejected instead of played in the clear.
+require-encryption=true

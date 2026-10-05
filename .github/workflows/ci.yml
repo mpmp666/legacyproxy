@@ -58,6 +58,13 @@ jobs:
       - name: Build LegacyProxy
         run: gradle --no-daemon build
 
+      # The connection-encryption layer is the part that cannot be exercised without a live
+      # server, so it carries its own deterministic self-test: key agreement from a synthetic
+      # handshake JWT, a packet round trip, and recovery from a lost and a duplicated datagram
+      # (the AES stream would otherwise desynchronise permanently).
+      - name: Self-test the encryption layer
+        run: java -cp build/classes/java/main:libs/Nukkit-MOT-SNAPSHOT.jar proxy.SelfTest
+
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:

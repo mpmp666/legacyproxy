@@ -29,7 +29,7 @@ public final class ProxyMain {
 
         // Frontend: RakNet v7 server that 0.14.3 clients connect to.
         LegacyRakNetServer frontend = new LegacyRakNetServer(config.listenPort,
-                "MCPE;LegacyProxy;70;0.14.3;0;20", () -> new ProxyClientSession(config.backend));
+                "MCPE;LegacyProxy;70;0.14.3;0;20", () -> new ProxyClientSession(config.backend, config.requireEncryption));
         frontend.start();
         System.out.println("[proxy] frontend up");
 

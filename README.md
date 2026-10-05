@@ -25,7 +25,10 @@ The backend needs these settings in `server.properties`:
 
 ```properties
 xbox-auth=off
-encryption=off
+# Leave connection encryption ON: the proxy implements the Bedrock handshake itself (see
+# "Connection encryption" below). Turning it off still works, but only if the proxy is told
+# require-encryption=false.
+encryption=on
 # The 0.14 client cannot send PlayerAuthInput, and this backend hard-codes server-authoritative
 # movement for protocol >= 1.21.90, so the proxy synthesises PlayerAuthInput itself.
 server-authoritative-movement=client-auth
@@ -74,6 +77,7 @@ java -cp "build\libs\legacyproxy-1.0.0.jar;libs\Nukkit-MOT-SNAPSHOT.jar" proxy.P
 listen-port=19132        # 0.14.3 clients connect here
 backend-host=127.0.0.1   # the modern server
 backend-port=19133
+require-encryption=true  # refuse to play unless the backend encrypts the connection
 ```
 
 ## Architecture
@@ -90,6 +94,7 @@ backend-port=19133
 |---|---|
 | `proxy/legacy/` | hand-written RakNet v7 server stack the 0.14.3 clients connect to |
 | `proxy/modern/ModernClient.java` | RakNet v11 client that logs into the backend |
+| `proxy/modern/BedrockEncryption.java` | the client half of Bedrock's connection encryption (handshake JWT → AES stream) |
 | `proxy/modern/ModernCodec.java` | builds client→server packets with the backend's own classes |
 | `proxy/modern/BackendRuntime.java` | boots the backend jar's item/block/runtime-id registries without a server |
 | `proxy/ChunkConverter.java` | modern sub-chunk palette → 0.14 columnar chunk format |
@@ -125,6 +130,25 @@ backend-port=19133
   `SetPlayerGameType` and the death/respawn pair are translated too.
 * **Filtering** — block ids, item ids, the creative menu and the recipe list are all filtered
   against the exact 0.14.3 id set.
+* **Connection encryption** — the proxy is a full Bedrock encryption peer, so the backend can
+  keep `encryption=on`. `proxy/modern/BedrockEncryption.java` derives the session key from the
+  `ServerToClientHandshake` (0x03) JWT exactly like the server side does:
+  `key = SHA-256(salt ‖ ECDH-P384(identityPrivate, serverEphemeralPublic))`, then
+  `AES/CTR` with `iv = key[0..12] ‖ 00 00 02` for protocol > 1.16.210 (`AES/CFB8` below that),
+  one stateful cipher per direction. Every frame after that is
+  `[0xfe][cipher(prefix ‖ compressed ‖ checksum)]` with
+  `checksum = SHA-256(LE64(counter) ‖ payload ‖ key)[0..8]`; the login chain carries a real
+  P-384 identity key so the server's `ECDH` has something to agree with.
+  With `require-encryption=true` (the default) a backend that never sends the handshake is
+  refused instead of being played in the clear.
+
+  Because that payload is a stream cipher, a single lost or duplicated datagram shifts every
+  later packet and the session would die with a checksum error. Two defences: the backend socket
+  asks for a 1 MiB receive buffer (the 75 KB `StartGame` burst is split over dozens of
+  datagrams), and `BedrockEncryption` can *resynchronise* — the trailing checksum is an 8-byte
+  oracle over `(counter, plaintext)`, so on mismatch it generates the keystream around the
+  expected offset once and scans small byte/counter offsets until a candidate reproduces its own
+  checksum, then re-seeks the cipher past the recovered packet and logs `[enc] RESYNC ...`.
 
 ## Limitations
 
