@@ -1,0 +1,9 @@
+# LegacyProxy configuration.
+# Copied to proxy.properties on first run if that file does not exist.
+
+# UDP port the 0.14.3 clients connect to.
+listen-port=19132
+
+# Modern Bedrock backend (Nukkit-MOT) to bridge to.
+backend-host=127.0.0.1
+backend-port=19133

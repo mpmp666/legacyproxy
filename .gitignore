@@ -1,0 +1,28 @@
+# Build output
+build/
+.gradle/
+out/
+
+# The Nukkit-MOT server jar is a compile/runtime dependency, never committed
+libs/
+
+# Runtime data
+logs/
+*.log
+capture_*.bin
+proxy.properties
+
+# Local dev scratch (probes, dumpers, generated tables)
+tools/
+rakref/
+*.dat
+*Test*.java
+*Dump.java
+BuildBlockMap.java
+CompTest.java
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.class

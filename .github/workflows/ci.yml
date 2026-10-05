@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # LegacyProxy compiles against Nukkit-MOT's own Bedrock packet codecs (it builds every
+      # modern packet with the server's classes, so the wire format can never drift). That jar
+      # is not published to Maven Central, so fetch the matching tag and build it once; the
+      # result is cached between runs.
+      - name: Cache Nukkit-MOT jar
+        id: cache-nukkit
+        uses: actions/cache@v4
+        with:
+          path: libs
+          key: nukkit-mot-1.26.50-R1
+
+      - name: Build Nukkit-MOT (compile dependency only)
+        if: steps.cache-nukkit.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch 1.26.50-R1 \
+            https://github.com/MemoriesOfTime/Nukkit-MOT.git /tmp/nukkit-mot
+          cd /tmp/nukkit-mot
+          mvn -B -q package -DskipTests
+          mkdir -p "$GITHUB_WORKSPACE/libs"
+          cp target/*.jar "$GITHUB_WORKSPACE/libs/Nukkit-MOT-SNAPSHOT.jar"
+          ls -l "$GITHUB_WORKSPACE/libs"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build LegacyProxy
+        run: gradle --no-daemon build
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacyproxy
+          path: build/libs/*.jar

@@ -1,0 +1,4 @@
+# Normalise line endings so the repo is consistent across platforms.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.jar binary
