@@ -29,9 +29,11 @@ xbox-auth=off
 # "Connection encryption" below). Turning it off still works, but only if the proxy is told
 # require-encryption=false.
 encryption=on
-# The 0.14 client cannot send PlayerAuthInput, and this backend hard-codes server-authoritative
-# movement for protocol >= 1.21.90, so the proxy synthesises PlayerAuthInput itself.
-server-authoritative-movement=client-auth
+# Movement is server-authoritative no matter what this says: the backend hard-codes
+# SERVER_WITH_REWIND for every protocol >= 1.21.90 (the proxy connects as 2193), so the 0.14
+# client's moves are validated and rewound by the server. The proxy satisfies that protocol by
+# synthesising PlayerAuthInput itself.
+server-authoritative-movement=server-auth
 # The proxy mirrors the old client's hotbar with legacy TYPE_NORMAL inventory transactions. It
 # works with either value of server-authoritative-inventory — but when it is ON the backend must
 # also recognise the session as a proxy, which is what "WaterDog mode" is for (see below).
@@ -123,8 +125,11 @@ require-encryption=true  # refuse to play unless the backend encrypts the connec
 * **Backend spawn** — `SetLocalPlayerAsInitialized` (0x71) is required, otherwise the backend
   never calls `doFirstSpawn()` and chat/commands/block interaction stay dead.
 * **Movement** — the backend ignores `MovePlayerPacket` for protocol ≥ 1.21.90, so movement is
-  sent as a synthesised `PlayerAuthInputPacket` (0x90). Teleports (`/tp`) come back as
-  `MovePlayerPacket` and are forwarded to the old client as `MovePlayer` with `MODE_RESET`.
+  sent as a synthesised `PlayerAuthInputPacket` (0x90). For that protocol the backend also
+  hard-codes `SERVER_WITH_REWIND`, so the server's anti-cheat owns the movement: every step the
+  proxy forwards is range-checked, and an implausible one is rewound (`MovePlayerPacket` with
+  `MODE_RESET`). Teleports (`/tp`) come back as `MovePlayerPacket` and are forwarded to the old
+  client as `MovePlayer` with `MODE_RESET`.
 * **Other players** — `AddPlayer` / `MoveEntityAbsolute` / `MoveEntityDelta` / `RemoveEntity`
   are translated, and 0.14↔0.14 players are relayed to each other inside the proxy (the
   backend's per-chunk viewer bookkeeping does not spawn proxy players to one another).
