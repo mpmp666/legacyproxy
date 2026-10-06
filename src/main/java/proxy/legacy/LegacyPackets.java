@@ -247,22 +247,36 @@ public final class LegacyPackets {
      * Layout per the Genisys/MPMPESCore reference: name, eid, pos, speed, yaw, headYaw, pitch,
      * metadata terminator.
      */
-    public static byte[] addPlayer(long eid, String name, float x, float y, float z,
+    /**
+     * 0.14 AddPlayer (id 0x96): makes another player appear to a legacy client.
+     *
+     * <p>Layout per both 0.14.3 references (Nukkit-0143 and MPMPESCore):
+     * {@code [uuid 16][string name][long eid][float x][y][z][speedX][speedY][speedZ]
+     * [yaw][headYaw][pitch][slot][metadata…]}.
+     *
+     * <p>The uuid is <b>not</b> optional and comes first: without it the client reads the first
+     * sixteen bytes of the name as the uuid, fails to make sense of the rest, drops the entity and
+     * ends up in a state where it no longer processes incoming chat. The held-item slot before the
+     * metadata terminator is required too (an empty slot is a single short 0).
+     */
+    public static byte[] addPlayer(byte[] uuid, long eid, String name, float x, float y, float z,
                                    float yaw, float pitch) {
         LegacyBinary.Writer w = new LegacyBinary.Writer();
         w.putByte(LegacyGameConstants.ADD_PLAYER);
+        w.putUUID(uuid);
         w.putString(name == null ? "" : name);
         w.putLong(eid);
         w.putFloat(x);
         w.putFloat(y);
         w.putFloat(z);
-        w.putFloat(0f);
-        w.putFloat(0f);
-        w.putFloat(0f);
+        w.putFloat(0f);                          // speedX
+        w.putFloat(0f);                          // speedY
+        w.putFloat(0f);                          // speedZ
         w.putFloat(yaw);
-        w.putFloat(yaw);
+        w.putFloat(yaw);                         // headYaw
         w.putFloat(pitch);
-        w.putByte(0x7f); // metadata terminator
+        w.putShort(0);                           // empty held-item slot
+        w.putByte(0x7f);                         // metadata terminator
         return w.toByteArray();
     }
 

@@ -749,7 +749,7 @@ public class ProxyClientSession implements LegacySessionListener {
                     return;                       // it left again while we were still loading
                 }
                 // 0.14 tracks the EYE position; the modern packet carries the FEET position.
-                sendLegacy(LegacyPackets.addPlayer(tracked.legacyId, tracked.name,
+                sendLegacy(LegacyPackets.addPlayer(uuid, tracked.legacyId, tracked.name,
                         tracked.x, tracked.y + EYE_HEIGHT, tracked.z, tracked.yaw, tracked.pitch));
                 // Also add a player-list entry, otherwise the pause menu stays empty and the client
                 // has no skin to build the model from. "Standard_Steve"/"Standard_Alex" are the only
@@ -1243,12 +1243,12 @@ public class ProxyClientSession implements LegacySessionListener {
             }
             try {
                 // show them to us, with their real skin (we parsed it from their own login)
-                sendLegacy(LegacyPackets.addPlayer(other.relayEid, other.username,
+                sendLegacy(LegacyPackets.addPlayer(other.uuid, other.relayEid, other.username,
                         other.lastX, other.lastY, other.lastZ, other.relayYaw, other.relayPitch));
                 sendLegacy(LegacyPackets.playerListAdd(other.uuid, other.relayEid, other.username,
                         other.modelName(), other.realSkin()));
                 // and show us to them
-                other.sendLegacy(LegacyPackets.addPlayer(relayEid, username,
+                other.sendLegacy(LegacyPackets.addPlayer(uuid, relayEid, username,
                         lastX, lastY, lastZ, relayYaw, relayPitch));
                 other.sendLegacy(LegacyPackets.playerListAdd(uuid, relayEid, username,
                         modelName(), realSkin()));
