@@ -327,11 +327,25 @@ public class ProxyClientSession implements LegacySessionListener {
             }
             long modernEid = modernEidForLegacy(targetEid);
             if (modernEid == 0) {
+                // 0.14↔0.14 players are shown by this proxy's own relay, not by the backend, so the
+                // target may be another session rather than one of our tracked entities: map its
+                // relay id onto that session's backend entity id.
+                for (ProxyClientSession other : SESSIONS.values()) {
+                    if (other != this && other.relayEid == targetEid && other.runtimeEntityId != 0) {
+                        modernEid = other.runtimeEntityId;
+                        System.out.println("[" + username + "] attack on relayed " + other.username
+                                + " -> backend modernEid=" + modernEid);
+                        break;
+                    }
+                }
+            }
+            if (modernEid == 0) {
                 System.out.println("[" + username + "] attack on an untracked entity legacyEid=" + targetEid);
                 return;
             }
-            System.out.println("[" + username + "] attack -> backend modernEid=" + modernEid);
-            quiet(() -> modernClient.sendBody(ModernCodec.attackEntity(modernEid, 0,
+            final long attackTarget = modernEid;
+            System.out.println("[" + username + "] attack -> backend modernEid=" + attackTarget);
+            quiet(() -> modernClient.sendBody(ModernCodec.attackEntity(attackTarget, 0,
                     0, 0, 0, lastX, lastY, lastZ, 0f, 0f, 0f)));
         } catch (Exception e) {
             System.out.println("[proxy] interact translate failed: " + e);
