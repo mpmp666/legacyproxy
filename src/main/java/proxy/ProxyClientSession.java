@@ -1366,19 +1366,24 @@ public class ProxyClientSession implements LegacySessionListener {
                 return;                                  // somebody else's metadata
             }
             int count = (int) Translator.readUVarInt64(payload, p);
+            StringBuilder keys = new StringBuilder();
             for (int i = 0; i < count && p[0] < payload.length; i++) {
                 long key = Translator.readUVarInt64(payload, p);
                 int type = (int) Translator.readUVarInt64(payload, p);
+                keys.append(key).append(':').append(type).append(' ');
                 if (key == 1 && type == 2) {             // DATA_HEALTH, int (zigzag varint)
                     long raw = Translator.readUVarInt64(payload, p);
                     int health = (int) ((raw >>> 1) ^ -(raw & 1));
                     health = Math.max(0, Math.min(20, health));
+                    System.out.println("[" + username + "] health -> " + health
+                            + " (metadata: " + keys.toString().trim() + ")");
                     sendLegacy(LegacyPackets.setHealth(health));
-                    System.out.println("[" + username + "] health -> " + health);
                     return;
                 }
                 skipMetadataValue(payload, p, type);
             }
+            System.out.println("[" + username + "] own metadata without DATA_HEALTH: "
+                    + keys.toString().trim());
         } catch (Exception e) {
             System.out.println("[proxy] SetEntityData translate failed: " + e);
         }
