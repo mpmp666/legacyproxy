@@ -47,7 +47,8 @@ public class ProxyClientSession implements LegacySessionListener {
      * what used to make modern players permanently invisible.
      */
     private volatile boolean worldReady;
-    private final java.util.List<Runnable> deferredLegacy = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** Rate limit for the entity-metadata diagnostics. */
+    private volatile long lastMetadataLog;    private final java.util.List<Runnable> deferredLegacy = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     // world state learned from the backend
     // 0.14.3 requires the local player's entity id to be 0.
@@ -1363,7 +1364,14 @@ public class ProxyClientSession implements LegacySessionListener {
             readZigZagVarLong(payload, p);               // entityUniqueId, not needed here
             long eid = Translator.readUVarInt64(payload, p);
             if (eid != runtimeEntityId) {
-                return;                                  // somebody else's metadata
+                // Someone else's metadata. Logged at a low rate because the backend sends a lot of
+                // it and the id is the only way to tell whether our own health ever arrives.
+                if (System.currentTimeMillis() - lastMetadataLog > 5000) {
+                    lastMetadataLog = System.currentTimeMillis();
+                    System.out.println("[" + username + "] metadata for eid=" + eid
+                            + " (ours=" + runtimeEntityId + ")");
+                }
+                return;
             }
             int count = (int) Translator.readUVarInt64(payload, p);
             StringBuilder keys = new StringBuilder();
