@@ -40,6 +40,15 @@ public class ProxyClientSession implements LegacySessionListener {
     private String skinName = "Standard_Custom";
     private byte[] skin = new byte[0];
 
+    /**
+     * Set once the 0.14 world bootstrap has gone out. Anything the old client cannot accept
+     * before that is queued instead of being sent into the void: an AddPlayer that arrives while
+     * it is still on its loading screen is dropped because its level does not exist yet, which is
+     * what used to make modern players permanently invisible.
+     */
+    private volatile boolean worldReady;
+    private final java.util.List<Runnable> deferredLegacy = new java.util.concurrent.CopyOnWriteArrayList<>();
+
     // world state learned from the backend
     // 0.14.3 requires the local player's entity id to be 0.
     private final long entityId = 0L;
@@ -394,6 +403,9 @@ public class ProxyClientSession implements LegacySessionListener {
             modernClient.onResourcePackStack = () -> quiet(() -> modernClient.sendResourcePackStatus(4));
             modernClient.onStartGame = () -> quiet(this::onBackendStartGame);
             modernClient.onGamePacket = this::onBackendGamePacket;
+            // A dropped backend connection is as final as a kick: tell the old client instead of
+            // leaving it in a world nothing is driving any more.
+            modernClient.onClosed = () -> kickLegacy("Connection to the server was lost");
             if (!modernClient.connect()) {
                 System.out.println("[proxy] backend handshake failed");
                 legacySession.close("backend handshake failed");
@@ -480,6 +492,17 @@ public class ProxyClientSession implements LegacySessionListener {
                 if (!sentChunks.isEmpty() || legacySession == null || legacySession.isClosed()) {
                     return;
                 }
+                // Chunks have not started after 1.5s. The backend spawns every entity that is
+                // already around us during doFirstSpawn, and it reads the chunks *we* have loaded
+                // at that moment — so the normal order is chunks first, spawn handshake second
+                // (see forwardChunk). Some sessions never get a proactive chunk stream though, and
+                // then that order deadlocks: the old client sits on its loading screen until the
+                // backend times it out. Breaking the deadlock costs the spawns of already-present
+                // players, which is strictly better than never loading at all.
+                if (i == 0) {
+                    System.out.println("[" + username + "] no chunk stream, forcing the spawn handshake");
+                    markLocallyInitialized();
+                }
                 System.out.println("[" + username + "] no chunks yet, re-requesting (attempt "
                         + (i + 2) + ")");
                 quiet(this::requestChunks);
@@ -492,6 +515,33 @@ public class ProxyClientSession implements LegacySessionListener {
         System.out.println("[proxy] 0.14 bootstrap sent for " + username);
     }
 
+    /** Runs {@code send} now if the 0.14 client already has its world, else queues it. */
+    private void sendLegacyWhenReady(Runnable send) {
+        if (worldReady) {
+            send.run();
+        } else {
+            deferredLegacy.add(send);
+        }
+    }
+
+    /** Delivers everything that was queued before the world bootstrap. */
+    private void flushDeferredLegacy() {
+        if (deferredLegacy.isEmpty()) {
+            return;
+        }
+        java.util.List<Runnable> pending = new java.util.ArrayList<>(deferredLegacy);
+        deferredLegacy.clear();
+        System.out.println("[" + username + "] flushing " + pending.size()
+                + " entity spawn(s) queued during loading");
+        for (Runnable send : pending) {
+            try {
+                send.run();
+            } catch (Throwable t) {
+                System.out.println("[" + username + "] deferred spawn failed: " + t);
+            }
+        }
+    }
+
     private void requestChunks() throws Exception {
         java.io.ByteArrayOutputStream p = new java.io.ByteArrayOutputStream();
         p.write(8);        // varint radius = 8
@@ -500,10 +550,62 @@ public class ProxyClientSession implements LegacySessionListener {
         System.out.println("[proxy] requested backend chunk radius 8");
     }
 
-    /** Every backend game packet: translate the interesting ones to 0.14. */
-    private void onBackendGamePacket(int packetId, byte[] payload) {
+    /**
+     * modern DisconnectPacket (0x05) — the backend kicked us or is shutting down.
+     *
+     * <p>Layout for protocol 2193: {@code [varint reason][uvarint hideDisconnectionScreen]
+     * [string message][string filteredMessage]}. The old client has its own DisconnectPacket
+     * (0x91) carrying only a message, so the reason and the filtered copy are dropped. Without
+     * this the 0.14 client is simply never told: it sits in the world with a dead backend
+     * connection until it times out on its own.
+     */
+    private void handleBackendDisconnect(byte[] payload) {
+        String message = "Disconnected from server";
         try {
+            int[] p = new int[]{0};
+            Translator.readUVarInt64(payload, p);                  // DisconnectFailReason
+            boolean hide = Translator.readUVarInt64(payload, p) != 0;
+            if (!hide) {
+                message = Translator.readString(payload, p);
+            }
+        } catch (Exception e) {
+            System.out.println("[" + username + "] disconnect parse failed: " + e);
+        }
+        System.out.println("[" + username + "] backend disconnected us: " + message);
+        kickLegacy(message);
+    }
+
+    /** Sends the 0.14 DisconnectPacket (0x91) and closes the old client's session. */
+    private void kickLegacy(String message) {
+        if (legacySession == null || legacySession.isClosed()) {
+            return;                                               // already gone
+        }
+        System.out.println("[" + username + "] telling the 0.14 client: " + message);
+        sendLegacy(LegacyPackets.disconnect(message));
+        // The packet is only queued; it has to be on the wire before the session goes away.
+        legacySession.flushNow();
+        legacySession.close(message);
+    }
+
+    /** Tells the backend we are locally initialised, once. This is what triggers doFirstSpawn(). */
+    private void markLocallyInitialized() {
+        if (locallyInitialized || modernClient == null) {
+            return;
+        }
+        locallyInitialized = true;
+        quiet(() -> {
+            modernClient.sendBody(ModernCodec.setLocalPlayerAsInitialized(runtimeEntityId));
+            System.out.println("[proxy] sent SetLocalPlayerAsInitialized to backend (eid "
+                    + runtimeEntityId + ")");
+        });
+    }
+
+    /** Every backend game packet: translate the interesting ones to 0.14. */
+    private void onBackendGamePacket(int packetId, byte[] payload) {        try {
             switch (packetId) {
+                case 0x05:  // DisconnectPacket — the backend kicked us or is shutting down
+                    handleBackendDisconnect(payload);
+                    break;
                 case 0x0b:  // StartGame 闁?record spawn/gamemode for the 0.14 StartGame
                     parseStartGame(payload);
                     break;
@@ -629,20 +731,35 @@ public class ProxyClientSession implements LegacySessionListener {
             return;                                            // that is us
         }
         TrackedEntity t = entities.get(eid);
-        if (t == null) {
+        boolean fresh = t == null;
+        if (fresh) {
             t = new TrackedEntity(nextLegacyEid.getAndIncrement(), name == null ? "" : name, uuid.clone());
             entities.put(eid, t);
-            // 0.14 tracks the EYE position; the modern packet carries the FEET position.
-            sendLegacy(LegacyPackets.addPlayer(t.legacyId, t.name, x, y + EYE_HEIGHT, z, yaw, pitch));
-            // Also add a player-list entry, otherwise the pause menu stays empty and the client
-            // has no skin to build the model from. "Standard_Steve"/"Standard_Alex" are the only
-            // model ids the 0.14.3 client knows; anything else and it drops the entry.
-            sendLegacy(LegacyPackets.playerListAdd(uuid, t.legacyId, t.name,
-                    "Standard_Steve", skinFor(uuid)));
-            System.out.println("[" + username + "] other player visible: " + t.name + " modernEid=" + eid
-                    + " legacyEid=" + t.legacyId);
         }
         t.x = x; t.y = y; t.z = z; t.yaw = yaw; t.headYaw = headYaw; t.pitch = pitch;
+        if (fresh) {
+            final TrackedEntity tracked = t;
+            // The backend announces a player the moment it enters our view, which is usually
+            // before we have finished sending the 0.14 world. Delivering it then is useless — the
+            // old client has no level to put the entity in and silently drops it — so it waits for
+            // the bootstrap (see sendLegacyWhenReady). The lambda reads the *current* position, so
+            // a player that keeps moving still lands where it actually is.
+            sendLegacyWhenReady(() -> {
+                if (entities.get(eid) != tracked) {
+                    return;                       // it left again while we were still loading
+                }
+                // 0.14 tracks the EYE position; the modern packet carries the FEET position.
+                sendLegacy(LegacyPackets.addPlayer(tracked.legacyId, tracked.name,
+                        tracked.x, tracked.y + EYE_HEIGHT, tracked.z, tracked.yaw, tracked.pitch));
+                // Also add a player-list entry, otherwise the pause menu stays empty and the client
+                // has no skin to build the model from. "Standard_Steve"/"Standard_Alex" are the only
+                // model ids the 0.14.3 client knows; anything else and it drops the entry.
+                sendLegacy(LegacyPackets.playerListAdd(uuid, tracked.legacyId, tracked.name,
+                        "Standard_Steve", skinFor(uuid)));
+                System.out.println("[" + username + "] other player visible: " + tracked.name
+                        + " modernEid=" + eid + " legacyEid=" + tracked.legacyId);
+            });
+        }
     }
 
     /** modern MoveEntityDeltaPacket (0x6f) -> 0.14 MovePlayer (0x9d). */
@@ -1267,12 +1384,18 @@ public class ProxyClientSession implements LegacySessionListener {
                 + Integer.toHexString(flags) + " (gamemode " + gamemode + ")");
     }
 
-    private void forwardText(byte[] payload) {        if (legacySession == null || legacySession.isClosed()) return;
+    private void forwardText(byte[] payload) {
+        if (legacySession == null || legacySession.isClosed()) return;
         String[] t = Translator.fromModernText(payload);
         int type;
         try { type = Integer.parseInt(t[0]); } catch (NumberFormatException e) { type = 0; }
         // map modern types onto the 0.14 ones (both use RAW=0, CHAT=1, TIP=5...)
-        sendLegacy(LegacyPackets.text(type, t[1], t[2]));
+        // Queued until the old client is actually in the world: text delivered while it is still
+        // on the loading screen is dropped, which is why chat could be sent but not received.
+        final int textType = type;
+        final String source = t[1];
+        final String message = t[2];
+        sendLegacyWhenReady(() -> sendLegacy(LegacyPackets.text(textType, source, message)));
     }
 
     /** Reads entityId/gamemode/position out of the modern StartGamePacket. */
@@ -1336,16 +1459,14 @@ public class ProxyClientSession implements LegacySessionListener {
                 float eyeY = spawnY + 1.62f;
                 sendLegacy(LegacyPackets.respawn(spawnX, eyeY, spawnZ));
                 sendLegacy(LegacyPackets.playStatus(3));
-                // Now that the old client is standing in the world, tell the backend that we are
-                // locally initialised. THIS is what makes it call doFirstSpawn(): the player gets
-                // spawned for real, shows up in the player list and every interaction handler that
-                // gates on player.spawned (chat, commands, block break/place) starts working.
-                quiet(() -> {
-                    modernClient.sendBody(ModernCodec.setLocalPlayerAsInitialized(runtimeEntityId));
-                    locallyInitialized = true;
-                    System.out.println("[proxy] sent SetLocalPlayerAsInitialized to backend (eid "
-                            + runtimeEntityId + ")");
-                });
+                // Only now does the old client actually have a level: everything that arrived
+                // while it was loading (other players, chat) was queued and can be delivered.
+                worldReady = true;
+                flushDeferredLegacy();
+                // Now that the old client is standing in the world, make sure the backend has been
+                // told we are locally initialised (it usually already has — see
+                // markLocallyInitialized — but this is the path that guarantees it).
+                markLocallyInitialized();
                 System.out.println("[proxy] 0.14 client " + username + " spawned after "
                         + sentChunks.size() + " chunks");
                 relaySpawn();
@@ -1484,7 +1605,9 @@ public class ProxyClientSession implements LegacySessionListener {
     @Override
     public void onDisconnect(LegacySession session, String reason) {
         relayDespawn();
-        if (modernClient != null) { modernClient.close(); modernClient = null; }
+        // Close the backend session politely, otherwise it keeps the player in the world until
+        // its own timeout and modern players see a ghost.
+        if (modernClient != null) { modernClient.closeGracefully(); modernClient = null; }
     }
 }
 

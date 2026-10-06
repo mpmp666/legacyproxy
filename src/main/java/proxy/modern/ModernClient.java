@@ -29,6 +29,8 @@ public class ModernClient {
     private static final int ID_CONNECTION_REQUEST_ACCEPTED = 0x10;
     private static final int ID_NEW_INCOMING_CONNECTION = 0x13;
     private static final int ID_DATA_PACKET_0 = 0x80;
+    /** RakNet DisconnectionNotification: the polite way to end a session. */
+    private static final int ID_DISCONNECTION_NOTIFICATION = 0x15;
     private static final int ID_ACK = 0xc0;
     private static final int GAME_PACKET_MARKER = 0xfe;
     /** Set -Dproxy.modern.batchdebug=true to dump every decompressed batch. */
@@ -61,6 +63,35 @@ public class ModernClient {
     public void close() {
         closed = true;
         socket.close();
+    }
+
+    /**
+     * Ends the session the way a real client does: a RakNet DisconnectionNotification, then the
+     * socket.
+     *
+     * <p>Simply dropping the socket leaves the backend holding the player until its own session
+     * timeout expires — modern players keep seeing the 0.14 player standing next to them for
+     * another half minute after it has actually gone. The notification makes the backend remove
+     * it right away.
+     */
+    public void closeGracefully() {
+        if (closed) {
+            return;
+        }
+        try {
+            // Sent a few times: it is a single unreliable datagram, and losing it means the backend
+            // keeps the player in the world until its own 10s session timeout instead of removing
+            // it immediately.
+            byte[] notification = {(byte) ID_DISCONNECTION_NOTIFICATION};
+            for (int i = 0; i < 3; i++) {
+                send(notification);
+            }
+            System.out.println("[modern] sent DisconnectionNotification to the backend");
+        } catch (Exception e) {
+            // the socket may already be unusable; the plain close below still applies
+            System.out.println("[modern] DisconnectionNotification failed: " + e);
+        }
+        close();
     }
 
     // ---- varint helpers ----
@@ -248,7 +279,48 @@ public class ModernClient {
         return Long.toString(value);
     }
 
-    /** Test harness: connect to a backend and report. Usage: ModernClient <host> <port> */
+    // ---- minimal readers used by the test harness to look into StartGamePacket ----
+
+    /** Advances past one varint and returns the new offset. */
+    private static int skipVarInt(byte[] b, int off) {
+        return off + varIntLen(b, off);
+    }
+
+    /** Length in bytes of the varint that starts at {@code off}. */
+    private static int varIntLen(byte[] b, int off) {
+        int len = 1;
+        while (off + len - 1 < b.length && (b[off + len - 1] & 0x80) != 0 && len < 10) {
+            len++;
+        }
+        return len;
+    }
+
+    /** Reads an unsigned varint (up to 64 bits) starting at {@code off}. */
+    private static long readVarInt(byte[] b, int off) {
+        long value = 0;
+        int shift = 0;
+        while (off < b.length) {
+            int byteValue = b[off++] & 0xff;
+            value |= (long) (byteValue & 0x7f) << shift;
+            if ((byteValue & 0x80) == 0) {
+                break;
+            }
+            shift += 7;
+            if (shift > 63) {
+                break;
+            }
+        }
+        return value;
+    }
+
+    /** Reads a little-endian float at {@code off}. */
+    private static float readFloatLE(byte[] b, int off) {
+        int bits = (b[off] & 0xff) | ((b[off + 1] & 0xff) << 8)
+                | ((b[off + 2] & 0xff) << 16) | ((b[off + 3] & 0xff) << 24);
+        return Float.intBitsToFloat(bits);
+    }
+
+    /** Test harness: connect to a backend and report. Usage: ModernClient <host> <port> [seconds] */
     public static void main(String[] args) throws Exception {
         String host = args.length > 0 ? args[0] : "127.0.0.1";
         int port = args.length > 1 ? Integer.parseInt(args[1]) : 19133;
@@ -259,41 +331,77 @@ public class ModernClient {
             return;
         }
         System.out.println("HANDSHAKE_OK");
+        // The StartGame payload is needed to learn our own runtime entity id and spawn position,
+        // both of which the spawn handshake and the movement heartbeat have to quote back.
+        final long[] self = new long[1];
+        final float[] pos = new float[3];
+        c.onGamePacket = (id, payload) -> {
+            if (id != 0x0b) {
+                return;
+            }
+            try {
+                // [zigzag varint64 entityId][varint runtimeEid][zigzag varint gamemode][float x][y][z]
+                int off = skipVarInt(payload, 0);
+                long eid = readVarInt(payload, off);
+                off += varIntLen(payload, off);
+                off += varIntLen(payload, off);              // gamemode
+                pos[0] = readFloatLE(payload, off);
+                pos[1] = readFloatLE(payload, off + 4);
+                pos[2] = readFloatLE(payload, off + 8);
+                self[0] = eid;
+                System.out.println("[modern] bot self eid=" + eid + " spawn=" + pos[0] + "," + pos[1] + "," + pos[2]);
+            } catch (Exception e) {
+                System.out.println("[modern] StartGame parse failed: " + e);
+            }
+        };
         // modern login flow: network settings first, then the login packet
         c.onNetworkSettings = () -> { try { c.sendLogin("ProxyBot"); } catch (Exception e) { System.out.println("[modern] login failed: " + e); } };
         c.onResourcePacksInfo = () -> { try { c.sendResourcePackStatus(4); } catch (Exception e) {} };
         c.onResourcePackStack = () -> { try { c.sendResourcePackStatus(4); } catch (Exception e) {} };
         c.onStartGame = () -> {
             try {
+                // SetLocalPlayerAsInitializedPacket (0x71) is what makes the backend call
+                // doFirstSpawn(): without it the session stays in the login phase, never "joins
+                // the game", is spawned to nobody and is eventually dropped by the login timeout.
+                c.sendBody(ModernCodec.setLocalPlayerAsInitialized(self[0]));
                 java.io.ByteArrayOutputStream p = new java.io.ByteArrayOutputStream();
                 p.write(3); p.write(3); p.write(3); p.write(3);   // RequestChunkRadiusPacket: varint radius=3
                 c.sendGamePacket(0x45, p.toByteArray());
-                System.out.println("[modern] chunk radius requested");
-            } catch (Exception e) {}
+                System.out.println("[modern] spawn handshake sent for eid=" + self[0]);
+                // A real client sends PlayerAuthInput every tick; the server uses it for the
+                // authoritative movement check and as the session heartbeat.
+                Thread beat = new Thread(() -> {
+                    long tick = 0;
+                    while (!c.closed) {
+                        try {
+                            c.sendBody(ModernCodec.playerAuthInput(pos[0], pos[1], pos[2],
+                                    0f, 0f, 0f, tick++));
+                            Thread.sleep(2000);
+                        } catch (InterruptedException e) {
+                            return;
+                        } catch (Exception e) {
+                            return;
+                        }
+                    }
+                }, "modern-bot-heartbeat");
+                beat.setDaemon(true);
+                beat.start();
+            } catch (Exception e) {
+                System.out.println("[modern] spawn handshake failed: " + e);
+            }
         };
         c.sendRequestNetworkSettings();
-        // read game packets for a while, decoding the batch wrapper
-        long end = System.currentTimeMillis() + 30000;
-        c.socket.setSoTimeout(2000);
-        while (System.currentTimeMillis() < end) {
-            try {
-                java.util.List<byte[]> frames = c.readFrames();
-                for (byte[] frame : frames) {
-                    if (frame.length == 0) continue;
-                    int fid = frame[0] & 0xff;
-                    if (fid == 0xfe) {
-                        c.decodeBatch(frame, 1);
-                    } else if (fid == 0x00) {
-                        c.sendConnectedPong(frame);
-                    } else {
-                        System.out.println("[modern] frame id=0x" + Integer.toHexString(fid) + " len=" + frame.length
-                                + " head=" + bytesToHex(frame, Math.min(20, frame.length)));
-                    }
-                }
-            } catch (java.net.SocketTimeoutException e) {
-                // keep waiting
-            }
-        }
+        // Run the real read loop so the encrypted handshake retry and the ACK/ordering logic work
+        // (the old bespoke loop skipped them and the session timed out during login). Stay alive
+        // for the requested duration, then close.
+        int seconds = args.length > 2 ? Integer.parseInt(args[2]) : 30;
+        Thread closer = new Thread(() -> {
+            try { Thread.sleep(seconds * 1000L); } catch (InterruptedException ignored) { }
+            c.close();
+        }, "modern-bot-ttl");
+        closer.setDaemon(true);
+        closer.start();
+        c.runReadLoop();
     }
 
     /** Decodes a 0xfe game frame's batch, printing each contained packet's id. */
@@ -510,6 +618,27 @@ public class ModernClient {
         } catch (Exception e) {
             return;
         }
+        // Keep the session alive on our own schedule: the bridge is otherwise silent whenever the
+        // 0.14 player is, and the backend would time the session out.
+        Thread keepalive = new Thread(() -> {
+            while (!closed) {
+                try {
+                    Thread.sleep(KEEPALIVE_MS);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (closed) {
+                    return;
+                }
+                try {
+                    sendConnectedPing();
+                } catch (Exception e) {
+                    return;
+                }
+            }
+        }, "modern-keepalive");
+        keepalive.setDaemon(true);
+        keepalive.start();
         while (!closed) {
             maybeResendHandshake();
             try {
@@ -535,8 +664,20 @@ public class ModernClient {
                 break;
             }
         }
-        close();
+        closeGracefully();
+        // The socket is gone, so the 0.14 client has to be told instead of being left in a world
+        // that no longer has a backend behind it.
+        if (onClosed != null) {
+            try {
+                onClosed.run();
+            } catch (Throwable t) {
+                System.out.println("[modern] onClosed failed: " + t);
+            }
+        }
     }
+
+    /** Invoked once when the backend connection ends, for any reason. */
+    public Runnable onClosed;
 
     /** Sends a game packet framed with the given packet id (proxy helper). */
     public void sendPacket(int packetId, byte[] payload) throws Exception {
@@ -919,9 +1060,29 @@ public class ModernClient {
         return out;
     }
 
+    /**
+     * Sends a RakNet ConnectedPing (0x00).
+     *
+     * <p>This is the session's own keepalive. Without it the bridge is only as talkative as the
+     * 0.14 client is: a player standing still sends nothing, the backend sees a silent session and
+     * drops it after its RakNet timeout — which is what made players get "randomly" kicked while
+     * they were idle.
+     */
+    public void sendConnectedPing() throws Exception {
+        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream(9);
+        b.write(0x00);                                  // ConnectedPing
+        long now = System.currentTimeMillis();
+        for (int i = 0; i < 8; i++) {
+            b.write((byte) (now >>> (56 - i * 8)));
+        }
+        sendFrame(b.toByteArray());
+    }
+
+    /** How often the bridge pings the backend to keep the session alive. */
+    private static final long KEEPALIVE_MS = 2000;
+
     /** Responds to a ConnectedPing (0x00) with a ConnectedPong (0x03). */
-    public void sendConnectedPong(byte[] pingPayload) throws Exception {
-        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+    public void sendConnectedPong(byte[] pingPayload) throws Exception {        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
         b.write(0x03);
         if (pingPayload.length >= 9) {
             b.write(pingPayload, 1, 8);   // echo the ping id

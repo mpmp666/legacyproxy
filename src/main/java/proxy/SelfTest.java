@@ -104,13 +104,33 @@ public final class SelfTest {
                 .encodeToString(s.getBytes(StandardCharsets.UTF_8));
     }
 
-    /** A plausible batch payload: a compression prefix byte followed by arbitrary data. */
+    /**
+     * A plausible batch payload: the compression prefix byte followed by a real raw-deflate
+     * stream. The resynchroniser recognises packet boundaries by trying to inflate them, so the
+     * test data has to look like what the backend actually sends.
+     */
     private static byte[] payload(int id, String text) {
         byte[] body = text.getBytes(StandardCharsets.UTF_8);
-        byte[] out = new byte[body.length + 2];
-        out[0] = 0x00;
-        out[1] = (byte) id;
-        System.arraycopy(body, 0, out, 2, body.length);
+        byte[] raw = new byte[body.length + 1];
+        raw[0] = (byte) id;
+        System.arraycopy(body, 0, raw, 1, body.length);
+
+        java.util.zip.Deflater deflater =
+                new java.util.zip.Deflater(java.util.zip.Deflater.DEFAULT_COMPRESSION, true);
+        deflater.setInput(raw);
+        deflater.finish();
+        java.io.ByteArrayOutputStream compressed = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[512];
+        while (!deflater.finished()) {
+            int n = deflater.deflate(buf);
+            compressed.write(buf, 0, n);
+        }
+        deflater.end();
+
+        byte[] packed = compressed.toByteArray();
+        byte[] out = new byte[packed.length + 1];
+        out[0] = 0x00;                                   // ZLIB compression prefix
+        System.arraycopy(packed, 0, out, 1, packed.length);
         return out;
     }
 

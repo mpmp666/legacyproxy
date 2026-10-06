@@ -22,7 +22,14 @@ public final class LegacySession {
     private static final int WINDOW_SIZE = 2048;
     private static final int MAX_SPLIT_SIZE = 128;
     private static final int MAX_SPLIT_COUNT = 4;
-    private static final long TIMEOUT_MS = 60_000L;
+    /**
+     * How long a 0.14 client may stay silent before its session is dropped. A real client pings
+     * every couple of seconds and sends a DisconnectionNotification when it quits, so this only
+     * covers clients that vanish without saying goodbye. It used to be 60s, which meant the
+     * backend kept the player in the world for up to a minute after the 0.14 client was gone —
+     * modern players saw a ghost standing next to them.
+     */
+    private static final long TIMEOUT_MS = 15_000L;
     private static final long RESEND_MS = 8_000L;
     private static final int MAX_MTU = 1464;
     /** Frames drained from the pending queue per tick (paces large bursts). */
@@ -607,8 +614,28 @@ public final class LegacySession {
         }
     }
 
-    public synchronized void close(String reason) {
-        if (closed) {
+    /**
+     * Pushes every queued game frame out right now.
+     *
+     * <p>Outbound frames are normally queued ({@code pendingFrames} → {@code sendQueue} →
+     * {@code pacedOut}) and released a few datagrams per tick, so a packet queued immediately
+     * before {@link #close(String)} would never leave: the session is torn down before its turn
+     * comes. A deliberate disconnect — the backend kicked us, or the backend connection died —
+     * has to deliver its reason first, otherwise the old client just sits in a dead world.
+     */
+    public synchronized void flushNow() {
+        LegacyEncapsulatedPacket p;
+        while ((p = pendingFrames.poll()) != null) {
+            addEncapsulatedToQueue(p);
+        }
+        flushSendQueue();
+        byte[] out;
+        while ((out = pacedOut.poll()) != null) {
+            manager.sendRaw(out, address);
+        }
+    }
+
+    public synchronized void close(String reason) {        if (closed) {
             return;
         }
         closed = true;

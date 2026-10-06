@@ -14,6 +14,7 @@ import java.security.spec.ECGenParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.zip.Inflater;
 
 /**
  * Client side of Bedrock's connection encryption ("ServerToClientHandshake").
@@ -260,6 +261,13 @@ public final class BedrockEncryption {
      */
     private static final int RESYNC_COUNTERS_BACK = 64;
     private static final int RESYNC_COUNTERS_FORWARD = 256;
+    /**
+     * Hard limit on one resynchronisation attempt. The scan is bounded work, but it runs on the
+     * read-loop thread: when a session is being torn down (a kick, a shutdown) the remaining
+     * packets are undecryptable and burning seconds here means the client is never told why it
+     * was disconnected. Giving up quickly lets the loop end and the disconnect be delivered.
+     */
+    private static final long RESYNC_BUDGET_MS = 3000;
 
     /**
      * Recovers from a lost or duplicated datagram.
@@ -286,24 +294,30 @@ public final class BedrockEncryption {
         int firstDelta = (int) (base - decryptStreamPos);
         byte[] candidate = new byte[region.length];
         int examined = 0;
+        long deadline = System.currentTimeMillis() + RESYNC_BUDGET_MS;
         for (int delta = firstDelta; delta <= RESYNC_FORWARD; delta++) {
+            if ((delta & 0xff) == 0 && System.currentTimeMillis() > deadline) {
+                break;                       // out of time: let the caller end the session
+            }
             int off = delta - firstDelta;
             if (off < 0 || off + region.length > keystream.length) {
                 break;
             }
-            // Cheap prefilter: every compressed batch begins with its compression prefix byte, so
-            // only offsets whose first plaintext byte is 0x00 can be a real packet boundary. That
-            // discards 255/256 of a megabyte-wide scan before any hashing happens.
+            // Cheap prefilter, then a very strong one: every compressed batch begins with its
+            // compression prefix byte (0x00) and the rest is a raw-deflate stream. A candidate at
+            // the wrong offset is essentially random bytes and will not inflate, so this throws
+            // away ~all of the wrong offsets for the price of one small inflate, and the expensive
+            // counter scan below only runs on the one or two offsets that can actually be right.
             if ((byte) (region[0] ^ keystream[off]) != 0x00) {
                 continue;
             }
-            examined++;
             for (int i = 0; i < candidate.length; i++) {
                 candidate[i] = (byte) (region[i] ^ keystream[off + i]);
             }
-            if (candidate.length < 9) {
+            if (candidate.length < 9 || !inflates(candidate, 1, candidate.length - 9)) {
                 continue;
             }
+            examined++;
             for (int cOff = -RESYNC_COUNTERS_BACK; cOff <= RESYNC_COUNTERS_FORWARD; cOff++) {
                 if (decryptCounter + cOff < 0) {
                     continue;
@@ -331,6 +345,39 @@ public final class BedrockEncryption {
                 + "B candidates=" + examined + " window=" + keystream.length + "B)");
     }
 
+    /**
+     * True when {@code [off, off+len)} is a raw-deflate stream that decompresses to something.
+     *
+     * <p>Used as the resynchroniser's structural prefilter: a candidate decrypted at the wrong
+     * stream offset is noise and will not inflate, so this rejects it without hashing it against
+     * every plausible packet counter.
+     */
+    private boolean inflates(byte[] data, int off, int len) {
+        if (len <= 0) {
+            return false;
+        }
+        try {
+            Inflater probe = INFLATER.get();
+            probe.reset();
+            probe.setInput(data, off, len);
+            byte[] sink = new byte[512];
+            int produced = 0;
+            while (produced < sink.length) {
+                int n = probe.inflate(sink, produced, sink.length - produced);
+                if (n == 0) {
+                    break;
+                }
+                produced += n;
+            }
+            return produced > 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static final ThreadLocal<Inflater> INFLATER =
+            ThreadLocal.withInitial(() -> new Inflater(true));
+
     /** A fresh cipher over the session key/IV. */
     private Cipher newCipher(int mode) throws Exception {
         Cipher c = Cipher.getInstance(transformation);
@@ -349,14 +396,15 @@ public final class BedrockEncryption {
         }
     }
 
-    /** SHA-256(LE64(counter) || payload || key)[0..8] — RakNetPlayerSession.calculateChecksum. */
+    /**
+     * SHA-256(LE64(counter) || payload || key)[0..8] — RakNetPlayerSession.calculateChecksum.
+     *
+     * <p>The digest is pooled per thread: the resynchroniser calls this a few million times in a
+     * row, and {@code MessageDigest.getInstance} per call dominated the scan.
+     */
     private byte[] checksum(long counter, byte[] payload, int off, int len) {
-        MessageDigest digest;
-        try {
-            digest = MessageDigest.getInstance("SHA-256");
-        } catch (Exception e) {
-            throw new AssertionError(e);
-        }
+        MessageDigest digest = DIGEST.get();
+        digest.reset();
         byte[] counterBytes = new byte[8];
         for (int i = 0; i < 8; i++) {
             counterBytes[i] = (byte) (counter >>> (i * 8));          // little endian
@@ -366,4 +414,12 @@ public final class BedrockEncryption {
         digest.update(key);
         return Arrays.copyOf(digest.digest(), 8);
     }
+
+    private static final ThreadLocal<MessageDigest> DIGEST = ThreadLocal.withInitial(() -> {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    });
 }
