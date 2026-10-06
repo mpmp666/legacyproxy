@@ -1152,6 +1152,12 @@ public class ProxyClientSession implements LegacySessionListener {
                 collectorLegacy = t != null ? t.legacyId : this.entityId;
             }
             sendLegacy(LegacyPackets.takeItemEntity(legacyItem, collectorLegacy));
+            // The pickup packet only plays the animation: the 0.14.3 server follows it with
+            // entity.kill(), which despawns the drop and sends RemoveEntity. Without this the
+            // item stays on the ground forever, because the backend's own RemoveEntityPacket
+            // arrives later, finds the mapping already consumed here and is dropped as "not yet
+            // shown to us".
+            sendLegacy(LegacyPackets.removeEntity(legacyItem));
         } catch (Exception e) {
             System.out.println("[proxy] TakeItemEntity translate failed: " + e);
         }
