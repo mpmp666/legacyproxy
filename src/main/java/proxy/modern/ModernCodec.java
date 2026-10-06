@@ -1,6 +1,7 @@
 package proxy.modern;
 
 import cn.nukkit.inventory.transaction.data.UseItemData;
+import cn.nukkit.inventory.transaction.data.UseItemOnEntityData;
 import cn.nukkit.item.Item;
 import cn.nukkit.math.BlockFace;
 import cn.nukkit.math.BlockVector3;
@@ -117,6 +118,32 @@ public final class ModernCodec {
      * Uses a legacy {@code TYPE_NORMAL} container transaction, which the backend accepts when
      * {@code server-authoritative-inventory} is off.
      */
+    /**
+     * InventoryTransactionPacket (0x1e) with UseItemOnEntityData: a hit on another entity.
+     *
+     * <p>{@code actionType = 1} is the attack action; the backend routes it to
+     * {@code target.attack(...)}, so the damage is computed and broadcast by the server exactly as
+     * for a modern client. This is what a 0.14 left-click turns into.
+     */
+    public static byte[] attackEntity(long entityRuntimeId, int hotbarSlot,
+                                      int itemId, int itemMeta, int itemCount,
+                                      double px, double py, double pz,
+                                      float clickX, float clickY, float clickZ) {
+        InventoryTransactionPacket pk = new InventoryTransactionPacket();
+        pk.transactionType = InventoryTransactionPacket.TYPE_USE_ITEM_ON_ENTITY;
+        pk.actions = new NetworkInventoryAction[0];
+
+        UseItemOnEntityData data = new UseItemOnEntityData();
+        data.entityRuntimeId = entityRuntimeId;
+        data.actionType = InventoryTransactionPacket.USE_ITEM_ON_ENTITY_ACTION_ATTACK;
+        data.hotbarSlot = hotbarSlot;
+        data.itemInHand = itemId > 0 ? Item.get(itemId, itemMeta, Math.max(1, itemCount)) : Item.get(0, 0, 0);
+        data.playerPos = new Vector3(px, py, pz);
+        data.clickPos = new Vector3(clickX, clickY, clickZ);
+        pk.transactionData = data;
+        return encode(pk);
+    }
+
     public static byte[] setInventorySlot(int slot, int itemId, int itemMeta, int count) {
         return setInventorySlot(slot, 0, 0, 0, itemId, itemMeta, count);
     }

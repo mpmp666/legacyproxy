@@ -184,6 +184,9 @@ public class ProxyClientSession implements LegacySessionListener {
             case 0xaa:  // UseItem (0.14) -> modern InventoryTransaction CLICK_BLOCK
                 handleLegacyUseItem(buffer, off);
                 break;
+            case 0xa9:  // Interact (0.14) -> modern InventoryTransaction USE_ITEM_ON_ENTITY
+                handleLegacyInteract(buffer, off);
+                break;
             case 0xab:  // PlayerAction (0.14) -> modern PlayerActionPacket (0x24)
                 handleLegacyPlayerAction(buffer, off);
                 break;
@@ -299,6 +302,49 @@ public class ProxyClientSession implements LegacySessionListener {
         } catch (Exception e) {
             System.out.println("[proxy] player action translate failed: " + e);
         }
+    }
+
+    /**
+     * 0.14 Interact (0xa9): {@code [byte action][long target]}, action 2 = left click.
+     *
+     * <p>A left click is how the old client attacks. It has to become a modern
+     * {@code InventoryTransaction} with {@code TYPE_USE_ITEM_ON_ENTITY} so that the backend runs
+     * the damage calculation and broadcasts the result itself. Without this translation a 0.14
+     * player simply cannot hit anybody — no matter what the target's version is.
+     *
+     * <p>The packet does not carry the held item, and it does not need to: the server damages with
+     * the item in its own authoritative inventory, which this bridge already mirrors.
+     */
+    private void handleLegacyInteract(byte[] buffer, int off) {
+        if (modernClient == null) return;
+        try {
+            proxy.legacy.LegacyBinary.Reader r = new proxy.legacy.LegacyBinary.Reader(buffer, off + 1);
+            int action = r.getByte();
+            long targetEid = r.getLong();
+            if (action != 2) {                       // ACTION_LEFT_CLICK; the rest is not an attack
+                return;
+            }
+            long modernEid = modernEidForLegacy(targetEid);
+            if (modernEid == 0) {
+                System.out.println("[" + username + "] attack on an untracked entity legacyEid=" + targetEid);
+                return;
+            }
+            System.out.println("[" + username + "] attack -> backend modernEid=" + modernEid);
+            quiet(() -> modernClient.sendBody(ModernCodec.attackEntity(modernEid, 0,
+                    0, 0, 0, lastX, lastY, lastZ, 0f, 0f, 0f)));
+        } catch (Exception e) {
+            System.out.println("[proxy] interact translate failed: " + e);
+        }
+    }
+
+    /** The modern runtime id behind a 0.14 entity id, or 0 when we are not tracking it. */
+    private long modernEidForLegacy(long legacyEid) {
+        for (java.util.Map.Entry<Long, TrackedEntity> e : entities.entrySet()) {
+            if (e.getValue().legacyId == legacyEid) {
+                return e.getKey();
+            }
+        }
+        return 0L;
     }
 
     /** 0.14 Respawn (0xb3) -> modern RespawnPacket (0x2d) with STATE_CLIENT_READY_TO_SPAWN. */
@@ -652,6 +698,9 @@ public class ProxyClientSession implements LegacySessionListener {
                     break;
                 case 0x3e:  // SetPlayerGameTypePacket 閳?/gamemode n from the backend
                     handleSetGameType(payload);
+                    break;
+                case 0x27:  // SetEntityDataPacket — carries our own health as DATA_HEALTH metadata
+                    handleSetEntityData(payload);
                     break;
                 case 0x2a:  // SetHealthPacket: health 0 shows the old client's death screen
                     handleSetHealth(payload);
@@ -1293,6 +1342,65 @@ public class ProxyClientSession implements LegacySessionListener {
         for (ProxyClientSession other : SESSIONS.values()) {
             other.sendLegacy(LegacyPackets.removeEntity(relayEid));
             other.sendLegacy(LegacyPackets.playerListRemove(uuid));
+        }
+    }
+
+    /**
+     * modern SetEntityDataPacket (0x27): entity metadata.
+     *
+     * <p>The backend reports the player's own health this way when they take damage —
+     * {@code SetHealthPacket} is only sent on respawn — so without reading DATA_HEALTH out of it
+     * the 0.14 health bar never moves and the player simply drops dead with a full bar.
+     *
+     * <p>Layout: {@code [zigzag varint uniqueId][uvarint runtimeEid][uvarint count]} then per entry
+     * {@code [uvarint key][uvarint type][value]}. The unique id comes first and is easy to miss —
+     * skipping it wrongly shifts every metadata entry.
+     */
+    private void handleSetEntityData(byte[] payload) {
+        if (legacySession == null || legacySession.isClosed()) return;
+        try {
+            int[] p = new int[]{0};
+            readZigZagVarLong(payload, p);               // entityUniqueId, not needed here
+            long eid = Translator.readUVarInt64(payload, p);
+            if (eid != runtimeEntityId) {
+                return;                                  // somebody else's metadata
+            }
+            int count = (int) Translator.readUVarInt64(payload, p);
+            for (int i = 0; i < count && p[0] < payload.length; i++) {
+                long key = Translator.readUVarInt64(payload, p);
+                int type = (int) Translator.readUVarInt64(payload, p);
+                if (key == 1 && type == 2) {             // DATA_HEALTH, int (zigzag varint)
+                    long raw = Translator.readUVarInt64(payload, p);
+                    int health = (int) ((raw >>> 1) ^ -(raw & 1));
+                    health = Math.max(0, Math.min(20, health));
+                    sendLegacy(LegacyPackets.setHealth(health));
+                    System.out.println("[" + username + "] health -> " + health);
+                    return;
+                }
+                skipMetadataValue(payload, p, type);
+            }
+        } catch (Exception e) {
+            System.out.println("[proxy] SetEntityData translate failed: " + e);
+        }
+    }
+
+    /** Advances past one metadata value of the given type. */
+    private static void skipMetadataValue(byte[] d, int[] p, int type) {
+        switch (type) {
+            case 0: p[0] += 1; break;                       // byte
+            case 1: p[0] += 2; break;                       // short
+            case 2: Translator.readUVarInt64(d, p); break;  // int (zigzag varint)
+            case 3: p[0] += 4; break;                       // float
+            case 4: Translator.readString(d, p); break;     // string
+            case 5: {                                       // NBT: short length + bytes
+                int len = (d[p[0]] & 0xff) | ((d[p[0] + 1] & 0xff) << 8);
+                p[0] += 2 + len;
+                break;
+            }
+            case 6: p[0] += 12; break;                      // vec3i
+            case 7: Translator.readUVarInt64(d, p); break;  // long
+            case 8: p[0] += 12; break;                      // vec3f
+            default: throw new IllegalArgumentException("unknown metadata type " + type);
         }
     }
 
