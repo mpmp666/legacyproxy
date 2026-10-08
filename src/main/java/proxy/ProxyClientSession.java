@@ -344,9 +344,27 @@ public class ProxyClientSession implements LegacySessionListener {
                 return;
             }
             final long attackTarget = modernEid;
-            System.out.println("[" + username + "] attack -> backend modernEid=" + attackTarget);
+            // The click position is where the hit lands: the target's own position. Sending zeros
+            // here (or a stale player position) is what makes the backend treat the hit as
+            // out of range and drop it.
+            double tx = lastX, ty = lastY, tz = lastZ;
+            TrackedEntity target = entities.get(attackTarget);
+            if (target != null) {
+                tx = target.x; ty = target.y; tz = target.z;
+            } else {
+                for (ProxyClientSession other : SESSIONS.values()) {
+                    if (other != this && other.runtimeEntityId == attackTarget) {
+                        tx = other.lastX; ty = other.lastY; tz = other.lastZ;
+                        break;
+                    }
+                }
+            }
+            final float clickX = (float) tx, clickY = (float) ty, clickZ = (float) tz;
+            final float playerX = (float) lastX, playerY = (float) lastY, playerZ = (float) lastZ;
+            System.out.println("[" + username + "] attack -> backend modernEid=" + attackTarget
+                    + " click=" + clickX + "," + clickY + "," + clickZ);
             quiet(() -> modernClient.sendBody(ModernCodec.attackEntity(attackTarget, 0,
-                    0, 0, 0, lastX, lastY, lastZ, 0f, 0f, 0f)));
+                    0, 0, 0, playerX, playerY, playerZ, clickX, clickY, clickZ)));
         } catch (Exception e) {
             System.out.println("[proxy] interact translate failed: " + e);
         }
@@ -1375,15 +1393,15 @@ public class ProxyClientSession implements LegacySessionListener {
         if (legacySession == null || legacySession.isClosed()) return;
         try {
             int[] p = new int[]{0};
-            readZigZagVarLong(payload, p);               // entityUniqueId, not needed here
+            long uniqueId = readZigZagVarLong(payload, p);
             long eid = Translator.readUVarInt64(payload, p);
-            if (eid != runtimeEntityId) {
+            if (eid != runtimeEntityId && uniqueId != runtimeEntityId) {
                 // Someone else's metadata. Logged at a low rate because the backend sends a lot of
                 // it and the id is the only way to tell whether our own health ever arrives.
                 if (System.currentTimeMillis() - lastMetadataLog > 5000) {
                     lastMetadataLog = System.currentTimeMillis();
                     System.out.println("[" + username + "] metadata for eid=" + eid
-                            + " (ours=" + runtimeEntityId + ")");
+                            + " unique=" + uniqueId + " (ours=" + runtimeEntityId + ")");
                 }
                 return;
             }
@@ -1393,9 +1411,15 @@ public class ProxyClientSession implements LegacySessionListener {
                 long key = Translator.readUVarInt64(payload, p);
                 int type = (int) Translator.readUVarInt64(payload, p);
                 keys.append(key).append(':').append(type).append(' ');
-                if (key == 1 && type == 2) {             // DATA_HEALTH, int (zigzag varint)
-                    long raw = Translator.readUVarInt64(payload, p);
-                    int health = (int) ((raw >>> 1) ^ -(raw & 1));
+                if (key == 1 && (type == 2 || type == 3)) {   // DATA_HEALTH as int or float
+                    int health;
+                    if (type == 2) {
+                        long raw = Translator.readUVarInt64(payload, p);
+                        health = (int) ((raw >>> 1) ^ -(raw & 1));
+                    } else {
+                        health = (int) Translator.readFloatLE(payload, p[0]);
+                        p[0] += 4;
+                    }
                     health = Math.max(0, Math.min(20, health));
                     System.out.println("[" + username + "] health -> " + health
                             + " (metadata: " + keys.toString().trim() + ")");
